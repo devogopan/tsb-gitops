@@ -1,0 +1,27 @@
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  annotations:
+    tsb.tetrate.io/gatewayGroup: tier2-gg-httpbin
+    tsb.tetrate.io/organization: tetrate
+    tsb.tetrate.io/tenant: tetrate
+    tsb.tetrate.io/workspace: tier2-httpbin
+  labels:  
+    istio.io/rev: tsb
+  name: gwhttpbin-4
+  namespace: tier2
+spec:
+  selector:
+    app: t2-gateway
+  servers:
+  - hosts:
+    - app-httpbin/zbin-4.aegle.info
+    port:
+      name: httpbin-4
+      number: 8443
+      protocol: HTTPS
+    tls:
+      credentialName: certs-aegle
+      minProtocolVersion: TLSV1_2
+      mode: SIMPLE
+---

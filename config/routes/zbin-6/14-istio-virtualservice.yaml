@@ -1,0 +1,26 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  annotations:
+    tsb.tetrate.io/gatewayGroup: tier2-gg-httpbin
+    tsb.tetrate.io/tenant: tetrate
+    tsb.tetrate.io/organization: tetrate
+    tsb.tetrate.io/workspace: tier2-httpbin
+  labels:
+    istio.io/rev: tsb
+  name: tier2-vs-httpbin-6
+  namespace: app-httpbin
+spec:
+  gateways:
+  - tier2/gwhttpbin-6
+  hosts:
+  - zbin-6.aegle.info
+  http:
+  - name: httpbin-6
+    route:
+    - destination:
+        host: httpbin.app-httpbin.svc.cluster.local
+        port:
+          number: 8000
+      weight: 100
+---
