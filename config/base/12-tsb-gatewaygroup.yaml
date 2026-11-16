@@ -1,0 +1,15 @@
+apiVersion: gateway.tsb.tetrate.io/v2
+kind: Group
+metadata:
+  name: tier2-gg-httpbin
+  namespace: tsb-config
+  annotations:
+    tsb.tetrate.io/organization: tetrate
+    tsb.tetrate.io/tenant: tetrate
+    tsb.tetrate.io/workspace: tier2-httpbin
+spec:
+  configMode: DIRECT
+  namespaceSelector:
+    names:
+    - demo/app-httpbin
+    - demo/tier2

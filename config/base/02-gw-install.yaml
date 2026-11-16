@@ -1,0 +1,11 @@
+apiVersion: install.tetrate.io/v1alpha1
+kind: Gateway
+metadata:
+  name: t2-gateway
+  namespace: tier2
+spec:
+  type: UNIFIED
+  kubeSpec:
+    service:
+      type: LoadBalancer
+---

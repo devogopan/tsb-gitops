@@ -1,0 +1,10 @@
+apiVersion: tsb.tetrate.io/v2
+kind: Tenant
+metadata:
+  name: tetrate
+  namespace: tsb-config
+  annotations:
+    tsb.tetrate.io/organization: tetrate
+spec:
+  displayName: tetrate
+  description: tetrate
