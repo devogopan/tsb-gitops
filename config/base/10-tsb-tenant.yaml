@@ -1,6 +1,8 @@
 apiVersion: tsb.tetrate.io/v2
 kind: Tenant
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   name: tetrate
   namespace: tsb-config
   annotations:

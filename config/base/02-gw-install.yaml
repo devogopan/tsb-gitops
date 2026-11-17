@@ -1,6 +1,8 @@
 apiVersion: install.tetrate.io/v1alpha1
 kind: Gateway
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
   name: t2-gateway
   namespace: tier2
 spec:

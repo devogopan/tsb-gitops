@@ -1,6 +1,8 @@
 apiVersion: gateway.tsb.tetrate.io/v2
 kind: Group
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
   name: tier2-gg-httpbin
   namespace: tsb-config
   annotations:

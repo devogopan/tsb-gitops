@@ -1,6 +1,8 @@
 apiVersion: tsb.tetrate.io/v2
 kind: Workspace
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
   name: tier2-httpbin
   namespace: tsb-config
   annotations:
