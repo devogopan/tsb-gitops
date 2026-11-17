@@ -2,6 +2,7 @@ apiVersion: networking.istio.io/v1beta1
 kind: Gateway
 metadata:
   annotations:
+    argocd.argoproj.io/sync-wave: "10"
     tsb.tetrate.io/gatewayGroup: tier2-gg-httpbin
     tsb.tetrate.io/organization: tetrate
     tsb.tetrate.io/tenant: tetrate

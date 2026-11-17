@@ -2,6 +2,7 @@ apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
   annotations:
+    argocd.argoproj.io/sync-wave: "11"
     tsb.tetrate.io/gatewayGroup: tier2-gg-httpbin
     tsb.tetrate.io/tenant: tetrate
     tsb.tetrate.io/organization: tetrate
