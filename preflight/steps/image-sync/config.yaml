@@ -1,0 +1,15 @@
+# THE TRIGGER FILE for this step. Edit this file in a PR to run the step.
+#   TSB_VERSION: target version. Also sets the tctl image tag (see kustomization.yaml).
+#   RUN_ID:      change it to re-run for the same version. Lower-case letters,
+#                digits and "-" only (it becomes part of a ConfigMap name).
+# This ConfigMap is a normal managed resource, so changing it makes the Argo CD
+# app OutOfSync and starts a sync, which runs the hook Job.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: image-sync-config
+  namespace: preflight
+data:
+  TSB_VERSION: "1.14.3005"
+  RUN_ID: "run-001"
+  TARGET_REGISTRY: "172.18.0.7:5000/tetrate"

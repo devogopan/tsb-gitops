@@ -1,0 +1,21 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: preflight-image-sync
+  namespace: argocd
+spec:
+  project: tsb
+  source:
+    repoURL: git@github.com:devogopan/tsb-gitops.git
+    targetRevision: main
+    path: preflight/steps/image-sync
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: preflight
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+    syncOptions:
+      - ServerSideApply=true
+---

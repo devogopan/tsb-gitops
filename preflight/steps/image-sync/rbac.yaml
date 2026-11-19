@@ -1,0 +1,30 @@
+# The Job records its result in the shared status ConfigMap preflight-<RUN_ID>.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: preflight
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: preflight
+  namespace: preflight
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: preflight
+subjects:
+  - kind: ServiceAccount
+    name: preflight
+    namespace: preflight

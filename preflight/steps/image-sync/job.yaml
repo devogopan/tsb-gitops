@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: image-sync
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight
+      imagePullSecrets:
+        - name: tetrate-pull
+      initContainers:
+        - name: sync
+          # The tag after ":" is replaced from config.yaml TSB_VERSION by kustomize.
+          image: containers.dl.tetrate.io/tctl:PLACEHOLDER
+          args:
+            - install
+            - image-sync
+            - --accept-eula
+            - --registry=172.18.0.7:5000/tetrate
+            - --insecure-registry
+            - --skip-demo-images
+          envFrom:
+            - secretRef:
+                name: tetrate-sync-creds
+      containers:
+        # Runs only if "sync" succeeded. A failed sync leaves no success key.
+        - name: report
+          # Any image with kubectl and a shell. Pin a real tag.
+          image: docker.io/alpine/k8s:PINNED_TAG
+          envFrom:
+            - configMapRef:
+                name: image-sync-config
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              CM="preflight-${RUN_ID}"
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || \
+                kubectl -n preflight create configmap "$CM"
+              kubectl -n preflight patch configmap "$CM" --type merge -p \
+                "{\"data\":{\"image-sync\":\"success\",\"image-sync.tsbVersion\":\"${TSB_VERSION}\",\"image-sync.registry\":\"${TARGET_REGISTRY}\",\"image-sync.completedAt\":\"${NOW}\"}}"
