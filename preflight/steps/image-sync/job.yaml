@@ -34,7 +34,7 @@ spec:
         # Runs only if "sync" succeeded. A failed sync leaves no success key.
         - name: report
           # Any image with kubectl and a shell. Pin a real tag.
-          image: docker.io/alpine/k8s:PINNED_TAG
+          image: docker.io/alpine/k8s:1.34.13
           envFrom:
             - configMapRef:
                 name: image-sync-config
