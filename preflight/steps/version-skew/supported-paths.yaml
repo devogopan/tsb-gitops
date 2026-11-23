@@ -1,0 +1,21 @@
+# Upgrade rules, taken from the TSB "Upgrading TSB" pages (1.11.x to 1.14.x).
+# Changing a rule is a reviewed PR. Rules, not a list of versions, so they keep working.
+#
+#   MAX_MINOR_DISTANCE     "N-2": MP and CP can be upgraded in place from up to 2 minor
+#                          versions behind. 1.12.x to 1.14.x is allowed, 1.11.x to 1.14.x is not.
+#   MAX_MP_CP_MINOR_GAP    "N-2": a CP may be at most 2 minor versions behind the MP.
+#
+# Always enforced in the script (not configurable):
+#   - target must be strictly newer than the current version (no same version, no downgrade)
+#   - CP version must not be newer than the MP version
+#
+# NOT checked here: data plane. TSB documents an "M-1" policy (CP 1.M supports DP 1.M-1).
+# Confirm with Tetrate how it applies while DP stays on the old version after the CP upgrade.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: supported-paths
+  namespace: preflight
+data:
+  MAX_MINOR_DISTANCE: "2"
+  MAX_MP_CP_MINOR_GAP: "2"

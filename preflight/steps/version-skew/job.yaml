@@ -1,0 +1,93 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: version-skew
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-version-skew
+      containers:
+        - name: check
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: version-skew-config}
+            - configMapRef: {name: supported-paths}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              REASONS=""
+              fail() { echo "FAIL: $1"; REASONS="${REASONS:+$REASONS; }$1"; }
+
+              # "1.14.4003" or "v1.14.4003" -> "1 14 4003". Empty if not x.y.z.
+              parse() { printf '%s' "$1" | sed -nE 's/^v?([0-9]+)\.([0-9]+)\.([0-9]+)$/\1 \2 \3/p'; }
+              # compare two parsed versions: prints 1 (a>b), 0 (equal), -1 (a<b)
+              cmpv() { awk -v a="$1" -v b="$2" 'BEGIN{split(a,x," ");split(b,y," ");for(i=1;i<=3;i++){if(x[i]+0>y[i]+0){print 1;exit}if(x[i]+0<y[i]+0){print -1;exit}}print 0}'; }
+              field() { printf '%s' "$1" | awk -v n="$2" '{print $n}'; }   # 1=major 2=minor 3=patch
+              # tag of the first container image of a Deployment
+              image_tag() {
+                img="$(kubectl -n "$1" get deployment "$2" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+                [ -n "$img" ] || return 1
+                base="${img%%@*}"; last="${base##*/}"
+                case "$last" in *:*) printf '%s' "${last##*:}" ;; *) return 1 ;; esac
+              }
+
+              command -v jq >/dev/null || { echo "jq missing in image"; exit 1; }
+              echo "target version: ${TSB_VERSION}"
+              echo "rules: max minor distance ${MAX_MINOR_DISTANCE}, max MP-CP minor gap ${MAX_MP_CP_MINOR_GAP}"
+              T="$(parse "${TSB_VERSION}")"
+              [ -n "$T" ] || fail "target version '${TSB_VERSION}' is not in x.y.z form"
+
+              # sets PLANE_V (parsed) and PLANE_RAW (as read)
+              check_plane() {   # label namespace deployment
+                PLANE_V=""; PLANE_RAW="unknown"
+                raw="$(image_tag "$2" "$3")" || { fail "$1: cannot read the image tag of deployment $3 in namespace $2"; return; }
+                PLANE_RAW="$raw"
+                PLANE_V="$(parse "$raw")"
+                [ -n "$PLANE_V" ] || { fail "$1: image tag '$raw' is not in x.y.z form"; return; }
+                echo "$1 current version: $raw"
+                [ -n "$T" ] || return
+                [ "$(cmpv "$T" "$PLANE_V")" = "1" ] || fail "$1: target ${TSB_VERSION} is not newer than current $raw"
+                [ "$(field "$T" 1)" = "$(field "$PLANE_V" 1)" ] || fail "$1: major version differs ($raw to ${TSB_VERSION})"
+                d=$(( $(field "$T" 2) - $(field "$PLANE_V" 2) ))
+                [ "$d" -le "$MAX_MINOR_DISTANCE" ] || fail "$1: upgrade spans $d minor versions, max is $MAX_MINOR_DISTANCE"
+              }
+
+              MP=""; CP=""; MP_RAW="not-checked"; CP_RAW="not-checked"
+              [ "$CHECK_MP" = "true" ] || [ "$CHECK_CP" = "true" ] || fail "CHECK_MP and CHECK_CP are both false, nothing to check"
+              if [ "$CHECK_MP" = "true" ]; then
+                check_plane "management plane" tsb tsb-operator-management-plane; MP="$PLANE_V"; MP_RAW="$PLANE_RAW"
+              fi
+              if [ "$CHECK_CP" = "true" ]; then
+                check_plane "control plane" istio-system tsb-operator-control-plane; CP="$PLANE_V"; CP_RAW="$PLANE_RAW"
+              fi
+
+              if [ -n "$MP" ] && [ -n "$CP" ]; then
+                [ "$(cmpv "$CP" "$MP")" != "1" ] || fail "control plane $CP_RAW is newer than management plane $MP_RAW"
+              fi
+              if [ -n "$CP" ] && [ -n "$T" ]; then
+                g=$(( $(field "$T" 2) - $(field "$CP" 2) ))
+                [ "$g" -le "$MAX_MP_CP_MINOR_GAP" ] || fail "once the management plane is on ${TSB_VERSION}, control plane $CP_RAW is $g minor versions behind (max $MAX_MP_CP_MINOR_GAP)"
+              fi
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg to "$TSB_VERSION" --arg mp "$MP_RAW" --arg cp "$CP_RAW" \
+                --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"version-skew":$s,"version-skew.to":$to,"version-skew.mpFrom":$mp,"version-skew.cpFrom":$cp,"version-skew.reason":$r,"version-skew.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1

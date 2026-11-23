@@ -1,0 +1,64 @@
+# Read-only access to the two operator Deployments, write access to the evidence ConfigMap.
+# No cluster-wide permissions: the AppProject only allows Namespace as a cluster resource.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-version-skew
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: version-skew-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: version-skew-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: version-skew-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-version-skew, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: version-skew-reader
+  namespace: tsb
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: version-skew-reader
+  namespace: tsb
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: version-skew-reader}
+subjects:
+  - {kind: ServiceAccount, name: preflight-version-skew, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: version-skew-reader
+  namespace: istio-system
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: version-skew-reader
+  namespace: istio-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: version-skew-reader}
+subjects:
+  - {kind: ServiceAccount, name: preflight-version-skew, namespace: preflight}
