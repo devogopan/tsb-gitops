@@ -1,0 +1,126 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: version-skew
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-version-skew
+      containers:
+        - name: check
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: version-skew-config}     # shared: target and declared versions
+            - configMapRef: {name: version-skew-cluster}    # this cluster: name and roles
+            - configMapRef: {name: supported-paths}         # shared: the rules
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              REASONS=""
+              fail() { echo "FAIL: $1"; REASONS="${REASONS:+$REASONS; }$1"; }
+              istrue() { [ "${1:-}" = "true" ]; }
+
+              # "1.14.4003" or "v1.14.4003" -> "1 14 4003". Empty if not x.y.z.
+              parse() { printf '%s' "$1" | sed -nE 's/^v?([0-9]+)\.([0-9]+)\.([0-9]+)$/\1 \2 \3/p'; }
+              # compare two parsed versions: prints 1 (a>b), 0 (equal), -1 (a<b)
+              cmpv() { awk -v a="$1" -v b="$2" 'BEGIN{split(a,x," ");split(b,y," ");for(i=1;i<=3;i++){if(x[i]+0>y[i]+0){print 1;exit}if(x[i]+0<y[i]+0){print -1;exit}}print 0}'; }
+              field() { printf '%s' "$1" | awk -v n="$2" '{print $n}'; }   # 1=major 2=minor 3=patch
+              norm() { printf '%s' "${1#v}"; }
+              # tag of the first container image of a Deployment
+              image_tag() {
+                img="$(kubectl -n "$1" get deployment "$2" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)"
+                [ -n "$img" ] || return 1
+                base="${img%%@*}"; last="${base##*/}"
+                case "$last" in *:*) printf '%s' "${last##*:}" ;; *) return 1 ;; esac
+              }
+
+              for t in kubectl jq sha256sum; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              echo "cluster=${CLUSTER_NAME} mp=${CHECK_MP} cp=${CHECK_CP}"
+              echo "target: ${TSB_VERSION}"
+              echo "declared: management plane ${MP_VERSION}, control planes ${CP_VERSIONS}"
+              echo "rules: max minor distance ${MAX_MINOR_DISTANCE}, max MP-CP minor gap ${MAX_MP_CP_MINOR_GAP}"
+
+              T="$(parse "${TSB_VERSION}")"
+              [ -n "$T" ] || fail "target version '${TSB_VERSION}' is not in x.y.z form"
+
+              # ---------- 1. rules on the DECLARED topology (the whole TSB) ----------
+              # sets PV (parsed). Returns 1 only if the version cannot be parsed.
+              check_version() {   # label raw
+                PV="$(parse "$2")"
+                [ -n "$PV" ] || { fail "$1: version '$2' is not in x.y.z form"; return 1; }
+                [ -n "$T" ] || return 0
+                [ "$(cmpv "$T" "$PV")" = "1" ] || fail "$1: target ${TSB_VERSION} is not newer than $2"
+                [ "$(field "$T" 1)" = "$(field "$PV" 1)" ] || fail "$1: major version differs ($2 to ${TSB_VERSION})"
+                d=$(( $(field "$T" 2) - $(field "$PV" 2) ))
+                [ "$d" -le "$MAX_MINOR_DISTANCE" ] || fail "$1: upgrade spans $d minor versions, max is $MAX_MINOR_DISTANCE"
+                return 0
+              }
+
+              MPP=""
+              check_version "management plane" "$MP_VERSION" && MPP="$PV"
+              [ -n "${CP_VERSIONS:-}" ] || fail "CP_VERSIONS is empty, list every control plane cluster"
+              for e in ${CP_VERSIONS:-}; do
+                case "$e" in *=*) ;; *) fail "CP_VERSIONS entry '$e' is not name=version"; continue ;; esac
+                n="${e%%=*}"; v="${e#*=}"
+                check_version "control plane $n" "$v" || continue
+                cpv="$PV"
+                if [ -n "$MPP" ] && [ "$(cmpv "$cpv" "$MPP")" = "1" ]; then
+                  fail "control plane $n ($v) is newer than the management plane ($MP_VERSION)"
+                fi
+                if [ -n "$T" ]; then
+                  g=$(( $(field "$T" 2) - $(field "$cpv" 2) ))
+                  [ "$g" -le "$MAX_MP_CP_MINOR_GAP" ] || fail "once the management plane is on ${TSB_VERSION}, control plane $n ($v) is $g minor versions behind (max $MAX_MP_CP_MINOR_GAP)"
+                fi
+              done
+
+              # ---------- 2. this cluster's REAL versions must match the declaration ----------
+              LOCAL_MP="not-checked"; LOCAL_CP="not-checked"
+              istrue "$CHECK_MP" || istrue "$CHECK_CP" || fail "CHECK_MP and CHECK_CP are both false, nothing to check in this cluster"
+              if istrue "$CHECK_MP"; then
+                if raw="$(image_tag tsb tsb-operator-management-plane)"; then
+                  LOCAL_MP="$raw"; echo "management plane real version: $raw"
+                  [ "$(norm "$raw")" = "$(norm "$MP_VERSION")" ] || fail "this cluster's management plane is $raw but MP_VERSION says $MP_VERSION"
+                else
+                  LOCAL_MP="unknown"; fail "management plane: cannot read the image tag of deployment tsb-operator-management-plane in namespace tsb"
+                fi
+              fi
+              if istrue "$CHECK_CP"; then
+                decl=""
+                for e in ${CP_VERSIONS:-}; do [ "${e%%=*}" = "$CLUSTER_NAME" ] && decl="${e#*=}"; done
+                [ -n "$decl" ] || fail "cluster $CLUSTER_NAME runs a control plane but is not listed in CP_VERSIONS"
+                if raw="$(image_tag istio-system tsb-operator-control-plane)"; then
+                  LOCAL_CP="$raw"; echo "control plane real version: $raw"
+                  if [ -n "$decl" ] && [ "$(norm "$raw")" != "$(norm "$decl")" ]; then
+                    fail "this cluster's control plane is $raw but CP_VERSIONS says $decl"
+                  fi
+                else
+                  LOCAL_CP="unknown"; fail "control plane: cannot read the image tag of deployment tsb-operator-control-plane in namespace istio-system"
+                fi
+              fi
+
+              # ---------- evidence ----------
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              HASH="$(printf '%s|%s|%s|%s|%s' "$TSB_VERSION" "$MP_VERSION" "$CP_VERSIONS" "$MAX_MINOR_DISTANCE" "$MAX_MP_CP_MINOR_GAP" | sha256sum | cut -c1-16)"
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg to "$TSB_VERSION" --arg h "$HASH" \
+                --arg lm "$LOCAL_MP" --arg lc "$LOCAL_CP" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"version-skew":$s,"version-skew.cluster":$c,"version-skew.to":$to,"version-skew.topologyHash":$h,"version-skew.localMp":$lm,"version-skew.localCp":$lc,"version-skew.reason":$r,"version-skew.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1

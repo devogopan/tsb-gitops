@@ -1,0 +1,23 @@
+# THE TRIGGER FOR THE WHOLE TSB. One file, applied to every cluster. Edit it in a PR and
+# every cluster's version-skew Job runs, because every cluster's ConfigMap changes.
+#
+#   TSB_VERSION  the version you plan to upgrade TO (all clusters).
+#   RUN_ID       change to re-run. Lower-case letters, digits and "-" only.
+#                Use the same value as the other preflight steps of this attempt.
+#   MP_VERSION   the version the management plane runs NOW.
+#   CP_VERSIONS  the version each control plane cluster runs NOW, as space separated
+#                <argocd-cluster-name>=<version>. Every CP cluster must be listed.
+#
+# MP_VERSION and CP_VERSIONS are a declaration. Each cluster's Job reads its own real
+# version and FAILS if it differs from what is declared here, so a stale or wrong
+# entry cannot pass. After a successful upgrade, update them in the same PR.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: version-skew-config
+  namespace: preflight
+data:
+  TSB_VERSION: "1.14.4003"
+  RUN_ID: "run-007"
+  MP_VERSION: "1.14.4000"
+  CP_VERSIONS: "in-cluster=1.14.4000"
