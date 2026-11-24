@@ -1,0 +1,38 @@
+# Apply by hand: kubectl -n argocd apply -f argocd-config/tsb-routes-applicationset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tsb-routes
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        revision: main
+        directories:
+          - path: config/routes/*
+  template:
+    metadata:
+      name: 'route-{{path.basename}}'
+      labels:
+        app.kubernetes.io/part-of: tsb-routes
+    spec:
+      project: tsb
+      source:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: tier2
+      syncPolicy:
+        syncOptions:
+          - ServerSideApply=true
+      ignoreDifferences:
+        - group: "*"
+          kind: "*"
+          jqPathExpressions:
+            - '.metadata.annotations["gitops.tsb.tetrate.io/applied-at"]'
+            - '.metadata.annotations["gitops.tsb.tetrate.io/applied-hash"]'
+            - '.metadata.finalizers'
+            - '.status'

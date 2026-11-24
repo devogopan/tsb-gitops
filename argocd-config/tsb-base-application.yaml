@@ -1,0 +1,26 @@
+# Apply by hand: kubectl -n argocd apply -f argocd-config/tsb-base-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: tsb-base
+  namespace: argocd
+spec:
+  project: tsb
+  source:
+    repoURL: git@github.com:devogopan/tsb-gitops.git
+    targetRevision: main
+    path: config/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: tsb-config
+  syncPolicy:
+    syncOptions:
+      - ServerSideApply=true
+  ignoreDifferences:
+    - group: "*"
+      kind: "*"
+      jqPathExpressions:
+        - '.metadata.annotations["gitops.tsb.tetrate.io/applied-at"]'
+        - '.metadata.annotations["gitops.tsb.tetrate.io/applied-hash"]'
+        - '.metadata.finalizers'
+        - '.status'

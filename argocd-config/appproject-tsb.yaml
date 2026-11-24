@@ -1,0 +1,26 @@
+# Apply by hand: kubectl -n argocd apply -f argocd-config/appproject-tsb.yaml
+# Not managed by any Argo CD Application (a bad edit must not lock Argo CD out of its own fix).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: tsb
+  namespace: argocd
+spec:
+  description: TSB config and upgrades
+  sourceRepos:
+    - git@github.com:devogopan/tsb-gitops.git
+  destinations:
+    # apps that point at the local cluster by URL (tsb-base, tsb-routes, image-sync)
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+    # apps that point at a cluster by name (cluster-health and version-skew ApplicationSets).
+    # Tighten to the real names once known, e.g. {name: in-cluster, namespace: "*"}, {name: cp-2, namespace: "*"}
+    - name: "*"
+      namespace: "*"
+  clusterResourceWhitelist:
+    - {group: "", kind: Namespace}
+    # needed by the cluster-health step (node and storageclass read access)
+    - {group: rbac.authorization.k8s.io, kind: ClusterRole}
+    - {group: rbac.authorization.k8s.io, kind: ClusterRoleBinding}
+  namespaceResourceWhitelist:
+    - {group: "*", kind: "*"}
