@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No "namespace:" on purpose: the Roles live in tsb and istio-system.
+resources:
+  - ../../base/common
+  - ../../base/job
+  - ../../base/cp      # remove on a cluster without the control plane
+  - ../../shared
+  - config.yaml

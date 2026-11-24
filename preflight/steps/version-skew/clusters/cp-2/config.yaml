@@ -1,0 +1,15 @@
+# Settings for ONE cluster. Static: you normally never edit this after creating it.
+# The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+#   CLUSTER_NAME  must equal the folder name, and the name used in CP_VERSIONS.
+#   CHECK_MP      "true" if this cluster runs the management plane.
+#   CHECK_CP      "true" if this cluster runs the control plane.
+# base/mp and base/cp in kustomization.yaml must match these two flags.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: version-skew-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "cp-2"
+  CHECK_MP: "false"
+  CHECK_CP: "true"

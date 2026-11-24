@@ -20,4 +20,4 @@ data:
   TSB_VERSION: "1.14.4003"
   RUN_ID: "run-007"
   MP_VERSION: "1.14.4000"
-  CP_VERSIONS: "in-cluster=1.14.4000"
+  CP_VERSIONS: "in-cluster=1.14.4000 cp-2=1.14.4000"
