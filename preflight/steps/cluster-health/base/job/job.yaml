@@ -154,13 +154,16 @@ spec:
               }
 
               # ---------- management plane ----------
+              # Postgres is checked through the Kubernetes API, not over the network. TSB's own NetworkPolicy
+              # (tsb/ingress-intra-namespace) only lets pods in the tsb namespace reach Postgres, so a TCP
+              # connect from the preflight namespace always times out. The Service must have a ready endpoint
+              # (Kubegres points it at the primary). A login test belongs to the backup step.
               check_postgres() {
-                if [ -z "${POSTGRES_HOST:-}" ]; then fail "postgres: POSTGRES_HOST is not set"; return; fi
-                if nc -z -w 3 "$POSTGRES_HOST" "${POSTGRES_PORT:-5432}" >/dev/null 2>&1; then
-                  pass "postgres: $POSTGRES_HOST:${POSTGRES_PORT:-5432} accepts connections"
-                else
-                  fail "postgres: cannot connect to $POSTGRES_HOST:${POSTGRES_PORT:-5432}"
-                fi
+                svc="${POSTGRES_SERVICE:-}"
+                if [ -z "$svc" ]; then fail "postgres: POSTGRES_SERVICE is not set"; return; fi
+                if ! kubectl -n tsb get endpointslices -l "kubernetes.io/service-name=$svc" -o json > "$D/pg.json" 2>/dev/null; then fail "postgres: cannot read endpoints of service tsb/$svc"; return; fi
+                r="$(jq '[.items[].endpoints[]? | select(.conditions.ready != false)] | length' "$D/pg.json")"
+                if [ "$r" -ge 1 ]; then pass "postgres: service tsb/$svc has $r ready endpoint(s)"; else fail "postgres: service tsb/$svc has no ready endpoint"; fi
               }
 
               check_elastic() {

@@ -17,7 +17,6 @@ data:
   # not applicable to a CP-only cluster; ELASTIC_CHECK is recorded in the evidence, so it is set
   ELASTIC_CHECK: "skip"
   ELASTIC_URL: ""
-  POSTGRES_HOST: ""
-  POSTGRES_PORT: ""
+  POSTGRES_SERVICE: ""
   MP_FRONT_SERVICE: ""
   REGISTRY_URLS: "http://172.18.0.2:5000"

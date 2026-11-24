@@ -10,7 +10,8 @@
 #   CP_REQUIRE_MP_CONNECTION  "true" = control plane must report a connection to the MP.
 #   ELASTIC_CHECK        "http" = check ELASTIC_URL /_cluster/health. "skip" = not checked, WARNING.
 #                        DEMO ONLY when skip. Production must be "http".
-#   POSTGRES_HOST/PORT   TCP reachability check from inside the cluster (MP clusters).
+#   POSTGRES_SERVICE     Service in tsb whose endpoints must be ready (MP clusters). Checked through the API,
+#                        because the tsb NetworkPolicy blocks TCP from other namespaces.
 #   MP_FRONT_SERVICE     Service in tsb that must have a load balancer address ("" = not checked).
 #   REGISTRY_URLS        space separated registry URLs to reach ("" = not checked).
 apiVersion: v1
@@ -27,7 +28,6 @@ data:
   CP_REQUIRE_MP_CONNECTION: "false"
   ELASTIC_CHECK: "skip"
   ELASTIC_URL: ""
-  POSTGRES_HOST: "tsb-postgres.tsb.svc.cluster.local"
-  POSTGRES_PORT: "5432"
+  POSTGRES_SERVICE: "tsb-postgres"
   MP_FRONT_SERVICE: "envoy"
   REGISTRY_URLS: "http://172.18.0.2:5000"
