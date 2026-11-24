@@ -1,0 +1,23 @@
+# SETTINGS FILE for ONE cluster (the re-run trigger, RUN_ID, is in ../../shared/config.yaml).
+# The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+# Control plane only. MP-only settings (Postgres, Elasticsearch, MP endpoint) are not used here.
+# Same values as in-cluster for the demo. Production: ALLOW_SCALED_DOWN "false", CP_REQUIRE_MP_CONNECTION "true".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-health-config
+  namespace: preflight
+data:
+  CLUSTER_NAME: "cp-2"
+  CHECK_MP: "false"
+  CHECK_CP: "true"
+  ALLOW_SCALED_DOWN: "true"
+  IGNORE_COMPONENTS: ""
+  CP_REQUIRE_MP_CONNECTION: "false"
+  # not applicable to a CP-only cluster; ELASTIC_CHECK is recorded in the evidence, so it is set
+  ELASTIC_CHECK: "skip"
+  ELASTIC_URL: ""
+  POSTGRES_HOST: ""
+  POSTGRES_PORT: ""
+  MP_FRONT_SERVICE: ""
+  REGISTRY_URLS: "http://172.18.0.2:5000"

@@ -1,0 +1,237 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cluster-health
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-cluster-health
+      containers:
+        - name: check
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: cluster-health-shared}   # shared: RUN_ID
+            - configMapRef: {name: cluster-health-config}   # this cluster: name, roles, settings
+            # Optional: ELASTIC_USER and ELASTIC_PASSWORD for ELASTIC_CHECK=http.
+            - secretRef: {name: elastic-creds, optional: true}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              D="$(mktemp -d)"; : > "$D/fail"; : > "$D/warn"; : > "$D/baseline-ns"
+              TAB="$(printf '\t')"
+              pass() { echo "PASS: $1"; }
+              warn() { echo "WARN: $1"; printf '%s\n' "$1" >> "$D/warn"; }
+              fail() { echo "FAIL: $1"; printf '%s\n' "$1" >> "$D/fail"; }
+              istrue() { [ "${1:-}" = "true" ]; }
+              join() { tr '\n' '|' | sed 's/|$//'; }
+
+              for t in kubectl jq curl nc; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} mp=${CHECK_MP} cp=${CHECK_CP} allowScaledDown=${ALLOW_SCALED_DOWN} elastic=${ELASTIC_CHECK}"
+
+              # ---------- every cluster ----------
+              check_nodes() {
+                if ! kubectl get nodes -o json > "$D/nodes.json" 2>/dev/null; then fail "nodes: cannot list nodes"; return; fi
+                n="$(jq '.items | length' "$D/nodes.json")"
+                [ "$n" -gt 0 ] || { fail "nodes: none returned"; return; }
+                bad="$(jq -r '.items[] | select(([.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown") != "True") | .metadata.name' "$D/nodes.json" | join)"
+                if [ -z "$bad" ]; then pass "nodes: $n Ready"; else fail "nodes: not Ready: $bad"; fi
+                press="$(jq -r '.items[] | . as $n | .status.conditions[]? | select((.type=="MemoryPressure" or .type=="DiskPressure" or .type=="PIDPressure") and .status=="True") | "\($n.metadata.name)/\(.type)"' "$D/nodes.json" | join)"
+                if [ -z "$press" ]; then pass "nodes: no pressure conditions"; else fail "nodes: pressure: $press"; fi
+              }
+
+              check_storage() {
+                if ! kubectl get storageclass -o json > "$D/sc.json" 2>/dev/null; then fail "storage: cannot list StorageClasses"; return; fi
+                d="$(jq -r '[.items[] | select(.metadata.annotations["storageclass.kubernetes.io/is-default-class"]=="true")] | length' "$D/sc.json")"
+                if [ "$d" -ge 1 ]; then pass "storage: default StorageClass present"; else fail "storage: no default StorageClass"; fi
+              }
+
+              check_dns() {
+                if ! kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns -o json > "$D/dns.json" 2>/dev/null; then fail "dns: cannot read kube-dns endpoints"; return; fi
+                r="$(jq '[.items[].endpoints[]? | select(.conditions.ready != false)] | length' "$D/dns.json")"
+                if [ "$r" -ge 1 ]; then pass "dns: $r ready kube-dns endpoint(s)"; else fail "dns: no ready kube-dns endpoints"; fi
+              }
+
+              check_registries() {
+                if [ -z "${REGISTRY_URLS:-}" ]; then warn "registry: REGISTRY_URLS is empty, not checked"; return; fi
+                for u in $REGISTRY_URLS; do
+                  code="$(curl -sk -m 5 -o /dev/null -w '%{http_code}' "${u%/}/v2/" 2>/dev/null)"
+                  case "$code" in
+                    200|401) pass "registry $u reachable (HTTP $code)" ;;
+                    *) fail "registry $u not reachable (HTTP ${code:-none})" ;;
+                  esac
+                done
+              }
+
+              # ---------- one namespace ----------
+              # Pods in a bad state. Also records pod and restart counts as the baseline.
+              check_pods() {   # namespace
+                ns="$1"
+                if ! kubectl -n "$ns" get pods -o json > "$D/pods-$ns.json" 2>/dev/null; then fail "$ns: cannot list pods"; return; fi
+                bad="$(jq -r '.items[] | .metadata.name as $n
+                  | ([.status.containerStatuses[]?, .status.initContainerStatuses[]? | .state.waiting.reason // empty
+                      | select(. == "CrashLoopBackOff" or . == "ImagePullBackOff" or . == "ErrImagePull" or . == "CreateContainerConfigError" or . == "CreateContainerError")] | first) as $w
+                  | if .status.phase == "Failed" then "\($n)=Failed"
+                    elif $w != null then "\($n)=\($w)"
+                    elif .status.phase == "Pending" and (now - (.metadata.creationTimestamp | fromdateiso8601)) > 600 then "\($n)=Pending>10m"
+                    else empty end' "$D/pods-$ns.json" | join)"
+                if [ -z "$bad" ]; then pass "$ns: no failing pods"; else fail "$ns: failing pods: $bad"; fi
+                jq -c '{pods: (.items | length), restarts: ([.items[].status.containerStatuses[]?.restartCount] | add // 0)}' "$D/pods-$ns.json" > "$D/base-$ns"
+                echo "$ns" >> "$D/baseline-ns"
+              }
+
+              # Deployments, StatefulSets and DaemonSets. Scaled to 0 is a warning only if ALLOW_SCALED_DOWN=true.
+              # Second argument: workloads that must be up even then, as Kind:name (space separated).
+              check_workloads() {   # namespace required
+                ns="$1"; required="$2"
+                if ! kubectl -n "$ns" get deploy,sts,ds -o json > "$D/wl-$ns.json" 2>/dev/null; then fail "$ns: cannot list workloads"; return; fi
+                jq -r '.items[] | [.kind, .metadata.name,
+                  (if .kind == "DaemonSet" then (.status.desiredNumberScheduled // 0) else (.spec.replicas // 1) end),
+                  (if .kind == "Deployment" then (.status.availableReplicas // 0) elif .kind == "StatefulSet" then (.status.readyReplicas // 0) else (.status.numberReady // 0) end)] | @tsv' \
+                  "$D/wl-$ns.json" > "$D/wl-$ns.tsv"
+                total=0; okn=0
+                while IFS="$TAB" read -r kind name want have; do
+                  total=$((total + 1))
+                  if [ "$want" -eq 0 ]; then
+                    if istrue "$ALLOW_SCALED_DOWN"; then warn "$ns/$name ($kind) is scaled to 0"; else fail "$ns/$name ($kind) is scaled to 0"; fi
+                  elif [ "$have" -lt "$want" ]; then
+                    fail "$ns/$name ($kind) has $have of $want ready"
+                  else
+                    okn=$((okn + 1))
+                  fi
+                done < "$D/wl-$ns.tsv"
+                [ "$total" -gt 0 ] || fail "$ns: no workloads found"
+                pass "$ns: $okn of $total workloads fully ready"
+                for r in $required; do
+                  rk="${r%%:*}"; rn="${r#*:}"
+                  if awk -F'\t' -v k="$rk" -v n="$rn" '$1==k && $2==n {ok = ($3 > 0 && $4 >= $3)} END {exit (ok ? 0 : 1)}' "$D/wl-$ns.tsv"; then
+                    pass "$ns/$rn is up"
+                  else
+                    fail "$ns/$rn must be up but is missing, scaled to 0 or not ready"
+                  fi
+                done
+              }
+
+              # TSB operator CR (ManagementPlane or ControlPlane): every component must be INSTALLED.
+              check_cr() {   # label namespace plural
+                label="$1"; ns="$2"; plural="$3"
+                if ! kubectl -n "$ns" get "$plural" -o json > "$D/cr-$plural.json" 2>/dev/null; then fail "$label: cannot read $plural in $ns"; return; fi
+                if [ "$(jq '.items | length' "$D/cr-$plural.json")" != "1" ]; then fail "$label: expected exactly one $plural in $ns"; return; fi
+                jq -r '.items[0].status.components // {} | . as $c
+                  | [paths(type == "object" and has("status"))] | .[] | . as $p | ($c | getpath($p)) as $v
+                  | [($p | map(tostring) | join(".")), ($v.status | tostring), ($v.connected | if . == null then "n/a" else tostring end), (($v.errorMessage // "-") | gsub("[\\t\\n]"; " "))] | @tsv' \
+                  "$D/cr-$plural.json" > "$D/cr-$plural.tsv"
+                total=0; okn=0
+                while IFS="$TAB" read -r path st conn err; do
+                  total=$((total + 1))
+                  if [ "$st" = "INSTALLED" ]; then
+                    if [ "$conn" = "false" ]; then fail "$label: component $path is installed but not connected"; else okn=$((okn + 1)); fi
+                  else
+                    case ",${IGNORE_COMPONENTS:-}," in
+                      *",$path,"*) warn "$label: component $path is $st (ignored by config)"; continue ;;
+                    esac
+                    case "$err" in
+                      "No replicas configured"*)
+                        if istrue "$ALLOW_SCALED_DOWN"; then warn "$label: component $path scaled down"; else fail "$label: component $path scaled down: $err"; fi ;;
+                      *) fail "$label: component $path is $st: $err" ;;
+                    esac
+                  fi
+                done < "$D/cr-$plural.tsv"
+                [ "$total" -gt 0 ] || fail "$label: CR has no component status"
+                pass "$label: $okn of $total CR components installed"
+              }
+
+              # ---------- management plane ----------
+              check_postgres() {
+                if [ -z "${POSTGRES_HOST:-}" ]; then fail "postgres: POSTGRES_HOST is not set"; return; fi
+                if nc -z -w 3 "$POSTGRES_HOST" "${POSTGRES_PORT:-5432}" >/dev/null 2>&1; then
+                  pass "postgres: $POSTGRES_HOST:${POSTGRES_PORT:-5432} accepts connections"
+                else
+                  fail "postgres: cannot connect to $POSTGRES_HOST:${POSTGRES_PORT:-5432}"
+                fi
+              }
+
+              check_elastic() {
+                case "${ELASTIC_CHECK:-}" in
+                  skip) warn "elasticsearch: NOT CHECKED (ELASTIC_CHECK=skip)" ;;
+                  http)
+                    if [ -z "${ELASTIC_URL:-}" ]; then fail "elasticsearch: ELASTIC_CHECK=http but ELASTIC_URL is empty"; return; fi
+                    auth=""; [ -n "${ELASTIC_USER:-}" ] && auth="-u ${ELASTIC_USER}:${ELASTIC_PASSWORD:-}"
+                    # shellcheck disable=SC2086
+                    st="$(curl -sk -m 10 $auth "${ELASTIC_URL%/}/_cluster/health" 2>/dev/null | jq -r '.status // empty' 2>/dev/null)"
+                    case "$st" in
+                      green) pass "elasticsearch: cluster health green" ;;
+                      yellow) warn "elasticsearch: cluster health yellow" ;;
+                      *) fail "elasticsearch: unreachable or red (status '${st:-none}')" ;;
+                    esac ;;
+                  *) fail "elasticsearch: ELASTIC_CHECK must be http or skip, got '${ELASTIC_CHECK:-}'" ;;
+                esac
+              }
+
+              check_mp_front() {
+                if [ -z "${MP_FRONT_SERVICE:-}" ]; then warn "mp-endpoint: MP_FRONT_SERVICE is empty, not checked"; return; fi
+                if ! kubectl -n tsb get svc "$MP_FRONT_SERVICE" -o json > "$D/front.json" 2>/dev/null; then fail "mp-endpoint: cannot read service tsb/$MP_FRONT_SERVICE"; return; fi
+                if [ "$(jq '.status.loadBalancer.ingress // [] | length' "$D/front.json")" -ge 1 ]; then
+                  pass "mp-endpoint: tsb/$MP_FRONT_SERVICE has a load balancer address"
+                else
+                  fail "mp-endpoint: tsb/$MP_FRONT_SERVICE has no load balancer address"
+                fi
+              }
+
+              # ---------- control plane ----------
+              check_cp_connections() {
+                f="$D/cr-controlplanes.json"
+                [ -s "$f" ] || return
+                e="$(jq -r '.items[0].status.components.xcp.edge.connected | if . == null then "missing" else tostring end' "$f")"
+                if [ "$e" = "true" ]; then pass "control plane: XCP edge is connected to the management plane"; else fail "control plane: XCP edge connected is '$e'"; fi
+                for k in managementPlaneConnection telemetryStoreConnection; do
+                  c="$(jq -r --arg k "$k" '.items[0].status[$k].connected | if . == null then "missing" else tostring end' "$f")"
+                  if [ "$c" = "true" ]; then pass "control plane: $k connected"
+                  elif istrue "${CP_REQUIRE_MP_CONNECTION:-false}"; then fail "control plane: $k connected is '$c'"
+                  else warn "control plane: $k connected is '$c' (not required by config)"; fi
+                done
+              }
+
+              # ---------- run ----------
+              check_nodes; check_storage; check_dns; check_registries
+              if istrue "$CHECK_MP"; then
+                check_pods tsb
+                check_workloads tsb "Deployment:tsb-operator-management-plane"
+                check_cr "management plane" tsb managementplanes
+                check_postgres; check_elastic; check_mp_front
+              fi
+              if istrue "$CHECK_CP"; then
+                check_pods istio-system
+                check_workloads istio-system "Deployment:tsb-operator-control-plane Deployment:istiod Deployment:edge"
+                check_cr "control plane" istio-system controlplanes
+                check_cp_connections
+              fi
+
+              # ---------- evidence ----------
+              FAILS="$(join < "$D/fail")"; WARNS="$(join < "$D/warn")"
+              STATUS=success; [ -s "$D/fail" ] && STATUS=failed
+              ROLES=""; istrue "$CHECK_MP" && ROLES="mp"; istrue "$CHECK_CP" && ROLES="${ROLES:+$ROLES,}cp"
+              BASE="$(for ns in $(cat "$D/baseline-ns"); do jq -c --arg ns "$ns" '{($ns): .}' "$D/base-$ns"; done | jq -s -c 'add // {}')"
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              CM="preflight-${RUN_ID}"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg ro "$ROLES" --arg w "$WARNS" --arg f "$FAILS" \
+                --arg b "$BASE" --arg sd "$ALLOW_SCALED_DOWN" --arg el "$ELASTIC_CHECK" --arg t "$NOW" \
+                '{data:{"cluster-health":$s,"cluster-health.cluster":$c,"cluster-health.roles":$ro,"cluster-health.warnings":$w,"cluster-health.failures":$f,"cluster-health.baseline":$b,"cluster-health.allowScaledDown":$sd,"cluster-health.elasticCheck":$el,"cluster-health.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "SUMMARY: $(wc -l < "$D/fail" | tr -d ' ') failure(s), $(wc -l < "$D/warn" | tr -d ' ') warning(s)"
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1

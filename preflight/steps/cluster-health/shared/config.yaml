@@ -1,0 +1,13 @@
+# THE TRIGGER FOR ALL CLUSTERS. One file, applied to every cluster. Edit it in a PR and every
+# cluster's cluster-health Job runs, because every cluster's ConfigMap changes.
+#
+#   RUN_ID  change to re-run. Lower-case letters, digits and "-" only.
+#           Use the same value as the other preflight steps (image-sync, version-skew) of this attempt,
+#           so all evidence lands in the same preflight-<RUN_ID> ConfigMap in each cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-health-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-008"

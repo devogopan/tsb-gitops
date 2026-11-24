@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No "namespace:" on purpose: the Roles live in tsb and istio-system.
+# Control plane only: no ../../base/mp (this cluster has no management plane, so no "tsb" namespace).
+resources:
+  - ../../base/common
+  - ../../base/job
+  - ../../base/cp
+  - ../../shared
+  - config.yaml

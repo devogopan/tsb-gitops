@@ -1,0 +1,33 @@
+# SETTINGS FILE for ONE cluster (the re-run trigger, RUN_ID, is in ../../shared/config.yaml). The folder name must be the cluster's
+# NAME in Argo CD (`argocd cluster list`). The local cluster is called "in-cluster".
+# To add a cluster: register it in Argo CD, copy this folder, rename it, edit this file.
+#
+#   CHECK_MP / CHECK_CP  "true" if this cluster runs the management / control plane.
+#                        The matching Role (base/mp, base/cp) must be listed in kustomization.yaml.
+#   ALLOW_SCALED_DOWN    "true" = a workload scaled to 0 is a WARNING. "false" = a FAILURE.
+#                        DEMO ONLY when true. Production must be "false".
+#   IGNORE_COMPONENTS    comma list of CR component paths to treat as warnings, e.g. "eck,oap"
+#   CP_REQUIRE_MP_CONNECTION  "true" = control plane must report a connection to the MP.
+#   ELASTIC_CHECK        "http" = check ELASTIC_URL /_cluster/health. "skip" = not checked, WARNING.
+#                        DEMO ONLY when skip. Production must be "http".
+#   POSTGRES_HOST/PORT   TCP reachability check from inside the cluster (MP clusters).
+#   MP_FRONT_SERVICE     Service in tsb that must have a load balancer address ("" = not checked).
+#   REGISTRY_URLS        space separated registry URLs to reach ("" = not checked).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-health-config
+  namespace: preflight
+data:
+  CLUSTER_NAME: "in-cluster"
+  CHECK_MP: "true"
+  CHECK_CP: "true"
+  ALLOW_SCALED_DOWN: "true"
+  IGNORE_COMPONENTS: ""
+  CP_REQUIRE_MP_CONNECTION: "false"
+  ELASTIC_CHECK: "skip"
+  ELASTIC_URL: ""
+  POSTGRES_HOST: "tsb-postgres.tsb.svc.cluster.local"
+  POSTGRES_PORT: "5432"
+  MP_FRONT_SERVICE: "envoy"
+  REGISTRY_URLS: "http://172.18.0.2:5000"
