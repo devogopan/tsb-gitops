@@ -1,0 +1,20 @@
+# Settings for ONE cluster. The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+# Run it on EVERY cluster (management plane and control planes).
+#   REQUIRE_TYPES      types that MUST exist and have at least one object here. Fails closed otherwise.
+#   SECRET_NAMESPACES  namespaces whose Secret METADATA (names, labels, annotations, never values) is recorded.
+#                      Each needs a Role in secrets-rbac.yaml.
+#   BACKUP_DIR         a folder on the backup volume (PVC preflight-backups, shared with backup-postgres)
+#   BACKUP_LIMIT_MB    everything under /backups (all steps) must stay below this. Keep equal to the PVC size (250Mi).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-k8s-objects-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "in-cluster"
+  REQUIRE_TYPES: "managementplanes.install.tetrate.io controlplanes.install.tetrate.io"
+  SECRET_NAMESPACES: "tsb istio-system"
+  BACKUP_DIR: "/backups/k8s"
+  KEEP_BACKUPS: "5"
+  BACKUP_LIMIT_MB: "250"
+  MIN_BYTES: "500"

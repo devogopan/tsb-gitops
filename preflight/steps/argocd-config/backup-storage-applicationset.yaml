@@ -1,0 +1,34 @@
+# One Application per folder in clusters/. Folder name = Argo CD cluster name. Creates only the backup PVC.
+# It is a separate Application so that no backup step owns the volume the others also use.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: preflight-backup-storage
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        revision: main
+        directories:
+          - path: preflight/common/backup-storage/clusters/*
+  template:
+    metadata:
+      name: 'preflight-backup-storage-{{path.basename}}'
+      labels:
+        app.kubernetes.io/part-of: preflight-backup-storage
+    spec:
+      project: tsb
+      source:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        name: '{{path.basename}}'
+        namespace: preflight
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: false
+        syncOptions:
+          - CreateNamespace=true

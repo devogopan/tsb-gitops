@@ -1,0 +1,146 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup-k8s-objects
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-backup-k8s-objects
+      containers:
+        - name: backup
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: backup-k8s-objects-shared}    # shared: RUN_ID, the list of types
+            - configMapRef: {name: backup-k8s-objects-cluster}   # this cluster: required types, secret namespaces
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq curl tar gzip zcat sha256sum du df awk; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              REASONS=""; FILE_PATH=""; SIZE=""; SHA=""; NTYPES=0; NOBJ=0; NSEC=0; SKIPPED=""; USED_MB=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} dir=${BACKUP_DIR} limit=${BACKUP_LIMIT_MB}MB"
+              W=/work/export; mkdir -p "$W"
+
+              run_backup() {
+                [ -d /backups ] && [ -w /backups ] || { addr "/backups is not mounted or not writable (is the PVC preflight-backups there?)"; return; }
+                mkdir -p "$BACKUP_DIR" || { addr "cannot create $BACKUP_DIR"; return; }
+
+                # 1. export every type that exists in this cluster
+                kubectl api-resources -o name > /work/apis 2>/dev/null || { addr "cannot list the API resources of this cluster"; return; }
+                : > /work/counts
+                for t in $EXPORT_TYPES; do
+                  if ! grep -qx "$t" /work/apis; then SKIPPED="${SKIPPED:+$SKIPPED }$t"; continue; fi
+                  if ! kubectl get "$t" -A -o json > "$W/$t.json" 2>/work/err; then addr "cannot list $t: $(head -1 /work/err)"; continue; fi
+                  n="$(jq '.items | length' "$W/$t.json" 2>/dev/null || echo bad)"
+                  case "$n" in ''|bad|*[!0-9]*) addr "unreadable answer for $t"; continue ;; esac
+                  echo "$t $n" >> /work/counts
+                  echo "exported $t: $n"
+                done
+                for t in ${REQUIRE_TYPES:-}; do
+                  n="$(awk -v t="$t" '$1 == t { print $2 }' /work/counts)"
+                  if [ -z "$n" ]; then addr "required type $t is not installed or could not be exported"
+                  elif [ "$n" -lt 1 ]; then addr "required type $t has no objects in this cluster"; fi
+                done
+                [ -z "$SKIPPED" ] || echo "WARN: types not installed here, skipped: $SKIPPED"
+                NTYPES="$(wc -l < /work/counts | tr -d ' ')"
+                NOBJ="$(awk '{ s += $2 } END { print s + 0 }' /work/counts)"
+                jq -R -s 'split("\n") | map(select(length > 0) | split(" ") | {(.[0]): (.[1] | tonumber)}) | add // {}' /work/counts > "$W/inventory.json"
+
+                # 2. namespaces, CRD versions, API version
+                kubectl get namespaces -o json 2>/dev/null | jq '[.items[] | {name: .metadata.name, labels: .metadata.labels}]' > "$W/namespaces.json" || addr "cannot list namespaces"
+                kubectl get crd -o json 2>/dev/null | jq -r '.items[] | "\(.metadata.name) \(.spec.versions | map(.name) | join(","))"' > "$W/crds.txt" || addr "cannot list CustomResourceDefinitions"
+                kubectl version -o json > "$W/kubectl-version.json" 2>/dev/null || echo "WARN: kubectl version not recorded"
+
+                # 3. Secret METADATA only: the API server is asked for metadata, and any answer with data is refused
+                TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+                CA=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                : > /work/secrets.ndjson
+                for ns in ${SECRET_NAMESPACES:-}; do
+                  if ! curl -sS --fail --cacert "$CA" -H "Authorization: Bearer $TOKEN" \
+                       -H 'Accept: application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1' \
+                       "https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}/api/v1/namespaces/$ns/secrets" > /work/sec.json 2>/work/err; then
+                    addr "cannot list secret metadata in namespace $ns: $(head -1 /work/err)"; continue
+                  fi
+                  if [ "$(jq -r '.kind' /work/sec.json)" != "PartialObjectMetadataList" ] || [ "$(jq '[.items[] | has("data") or has("stringData")] | any' /work/sec.json)" != "false" ]; then
+                    addr "the API server did not return metadata only for secrets in $ns, refusing to store it"; continue
+                  fi
+                  jq -c '.items[] | {namespace: .metadata.namespace, name: .metadata.name, created: .metadata.creationTimestamp, labels: (.metadata.labels // {}), annotations: ((.metadata.annotations // {}) | del(.["kubectl.kubernetes.io/last-applied-configuration"])), owners: [.metadata.ownerReferences[]?.kind]}' /work/sec.json >> /work/secrets.ndjson
+                done
+                jq -s '.' /work/secrets.ndjson > "$W/secrets-metadata.json"
+                NSEC="$(jq 'length' "$W/secrets-metadata.json")"
+                echo "secret metadata recorded: $NSEC"
+
+                # stop here if anything above failed: do not store a partial export as a backup
+                [ -z "$REASONS" ] || return
+
+                NOW_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+                jq -n --arg c "$CLUSTER_NAME" --arg r "$RUN_ID" --arg t "$NOW_ID" --arg sk "$SKIPPED" --argjson nt "$NTYPES" --argjson no "$NOBJ" --argjson ns "$NSEC" \
+                  '{cluster: $c, runId: $r, createdAt: $t, typesExported: $nt, objects: $no, secretsMetadata: $ns, skippedTypes: ($sk | split(" ") | map(select(length > 0)))}' > "$W/manifest.json"
+
+                # 4. package, verify, and check there is room on the backup volume
+                FILE="k8s-${CLUSTER_NAME}-${RUN_ID}-${NOW_ID}.tar.gz"
+                tar -C /work -czf "/work/$FILE" export || { addr "tar failed"; return; }
+                gzip -t "/work/$FILE" 2>/dev/null || { addr "the archive is not valid gzip"; return; }
+                FILES="$(tar -tzf "/work/$FILE" | grep -vc '/$' || true)"
+                [ "${FILES:-0}" -ge 5 ] || { addr "the archive has only ${FILES:-0} files"; return; }
+                SIZE="$(wc -c < "/work/$FILE" | tr -d ' ')"
+                [ "$SIZE" -ge "$MIN_BYTES" ] || { addr "the archive is only $SIZE bytes (minimum $MIN_BYTES)"; return; }
+                SRC_SHA="$(sha256sum "/work/$FILE" | cut -d' ' -f1)"
+                NEED_KB=$(( SIZE / 1024 + 1 ))
+                USED_KB="$(du -sk /backups | cut -f1)"
+                AVAIL_KB="$(df -Pk /backups | tail -1 | awk '{print $4}')"
+                ROOM_KB=$(( BACKUP_LIMIT_MB * 1024 - USED_KB ))
+                [ "$AVAIL_KB" -ge "$ROOM_KB" ] || ROOM_KB="$AVAIL_KB"
+                echo "archive ${NEED_KB} KB, backup volume used ${USED_KB} KB, room ${ROOM_KB} KB"
+                [ "$ROOM_KB" -ge "$NEED_KB" ] || { addr "not enough room on the backup volume: ${ROOM_KB} KB left under the ${BACKUP_LIMIT_MB} MB limit, the archive is ${NEED_KB} KB"; return; }
+
+                # 5. copy to the backup volume as .part, rename when it matches, write the checksum, read it back
+                cp "/work/$FILE" "$BACKUP_DIR/$FILE.part" || { addr "cannot copy the archive to $BACKUP_DIR"; return; }
+                DST_SHA="$(sha256sum "$BACKUP_DIR/$FILE.part" | cut -d' ' -f1)"
+                [ "$DST_SHA" = "$SRC_SHA" ] || { rm -f "$BACKUP_DIR/$FILE.part"; addr "the copy on the backup volume does not match the archive"; return; }
+                mv "$BACKUP_DIR/$FILE.part" "$BACKUP_DIR/$FILE"
+                ( cd "$BACKUP_DIR" && sha256sum "$FILE" > "$FILE.sha256" && sha256sum -c "$FILE.sha256" >/dev/null 2>&1 ) || { addr "read-back failed: $BACKUP_DIR/$FILE does not match its sha256"; return; }
+                SHA="$SRC_SHA"; FILE_PATH="$BACKUP_DIR/$FILE"
+
+                # 6. keep the newest KEEP_BACKUPS archives of this cluster (and their checksum files)
+                ls -1t "$BACKUP_DIR"/k8s-"${CLUSTER_NAME}"-*.tar.gz 2>/dev/null | tail -n +$(( KEEP_BACKUPS + 1 )) | while IFS= read -r old; do
+                  rm -f "$old" "$old.sha256"; echo "pruned $old"
+                done
+                USED_MB=$(( $(du -sk /backups | cut -f1) / 1024 ))
+                echo "PASS: $FILE_PATH, $SIZE bytes, $NOBJ objects of $NTYPES types, $NSEC secrets (metadata), sha256 $SHA (backup volume now ${USED_MB} MB of ${BACKUP_LIMIT_MB} MB)"
+              }
+              run_backup
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg f "$FILE_PATH" --arg sz "$SIZE" --arg sha "$SHA" \
+                --arg nt "$NTYPES" --arg no "$NOBJ" --arg nsec "$NSEC" --arg sk "$SKIPPED" --arg um "$USED_MB" --arg lm "$BACKUP_LIMIT_MB" \
+                --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"backup-k8s-objects":$s,"backup-k8s-objects.cluster":$c,"backup-k8s-objects.file":$f,"backup-k8s-objects.sizeBytes":$sz,"backup-k8s-objects.sha256":$sha,"backup-k8s-objects.types":$nt,"backup-k8s-objects.objects":$no,"backup-k8s-objects.secretsMetadata":$nsec,"backup-k8s-objects.skippedTypes":$sk,"backup-k8s-objects.volumeUsedMB":$um,"backup-k8s-objects.volumeLimitMB":$lm,"backup-k8s-objects.storage":"pvc preflight-backups (same node disk on kind)","backup-k8s-objects.reason":$r,"backup-k8s-objects.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: backups, mountPath: /backups}
+            - {name: work, mountPath: /work}
+      volumes:
+        - name: backups
+          persistentVolumeClaim: {claimName: preflight-backups}
+        - name: work
+          emptyDir: {sizeLimit: 1Gi}

@@ -1,0 +1,48 @@
+# THE TRIGGER AND THE LIST FOR ALL CLUSTERS. Edit it in a PR and every cluster's export runs again.
+#   RUN_ID        change to re-run. Lower-case letters, digits and "-" only. Same value as the other preflight steps.
+#   EXPORT_TYPES  space separated resource types (name.group) exported from ALL namespaces as JSON.
+#                 A type that is not installed in a cluster is skipped and listed in the evidence.
+#                 A type listed in REQUIRE_TYPES (per cluster) that is missing or empty fails the step.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-k8s-objects-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-011"
+  EXPORT_TYPES: >-
+    managementplanes.install.tetrate.io
+    controlplanes.install.tetrate.io
+    kubegres.kubegres.reactive-tech.io
+    istiooperators.install.istio.io
+    gateways.networking.istio.io
+    virtualservices.networking.istio.io
+    envoyfilters.networking.istio.io
+    destinationrules.networking.istio.io
+    sidecars.networking.istio.io
+    serviceentries.networking.istio.io
+    workloadentries.networking.istio.io
+    authorizationpolicies.security.istio.io
+    peerauthentications.security.istio.io
+    requestauthentications.security.istio.io
+    wasmplugins.extensions.istio.io
+    telemetries.telemetry.istio.io
+    egressgateways.gateway.xcp.tetrate.io
+    gateways.gateway.xcp.tetrate.io
+    gatewaygroups.gateway.xcp.tetrate.io
+    ingressgateways.gateway.xcp.tetrate.io
+    tier1gateways.gateway.xcp.tetrate.io
+    istiointernalgroups.istiointernal.xcp.tetrate.io
+    securitygroups.security.xcp.tetrate.io
+    securitysettings.security.xcp.tetrate.io
+    servicesecuritysettings.security.xcp.tetrate.io
+    serviceroutes.traffic.xcp.tetrate.io
+    trafficgroups.traffic.xcp.tetrate.io
+    trafficsettings.traffic.xcp.tetrate.io
+    wasmplugindefinitions.extension.xcp.tetrate.io
+    workspaces.xcp.tetrate.io
+    workspacesettings.xcp.tetrate.io
+    globalsettings.xcp.tetrate.io
+    externalsecrets.external-secrets.io
+    secretstores.external-secrets.io
+    clustersecretstores.external-secrets.io

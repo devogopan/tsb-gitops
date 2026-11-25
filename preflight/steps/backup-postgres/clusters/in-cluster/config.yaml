@@ -1,9 +1,10 @@
 # Settings for the cluster that runs Postgres (the management plane cluster). Folder name = Argo CD cluster name.
 # Only MP clusters get a folder here: control plane clusters have no Postgres.
 #
-# STORAGE: the dump is written into the Postgres pod's own data volume (next to, not inside, PGDATA).
-# That is the same disk as the database. It proves the dump works, it does NOT protect against losing the disk.
-# The evidence says so (backup-postgres.storage). Production must use a separate volume or a bucket.
+# STORAGE: the dump is streamed out of the Postgres pod (kubectl exec) into the backup volume of this cluster,
+# the PVC preflight-backups (preflight/common/backup-storage), mounted at /backups. The database's own disk is not used.
+# On kind that volume is still a folder on the node's disk, so it protects against a Postgres volume problem,
+# NOT against losing the node. The evidence says so (backup-postgres.storage). Production uses a bucket.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,8 +13,7 @@ metadata:
 data:
   CLUSTER_NAME: "in-cluster"
   POSTGRES_NAMESPACE: "tsb"
-  # exactly ONE pod must match. Kubegres labels the primary replicationRole=primary. Verify with
-  #   kubectl -n tsb get pods --show-labels | grep postgres
+  # exactly ONE pod must match. Kubegres labels the primary replicationRole=primary.
   POSTGRES_POD_SELECTOR: "app=tsb-postgres,replicationRole=primary"
   # empty = the first container of the pod (the second is postgres-exporter)
   POSTGRES_CONTAINER: ""
@@ -22,9 +22,9 @@ data:
   PG_SECRET: "postgres-credentials"
   # the Secret has these keys: .pg_service.conf, config.yaml, embedded-postgres-password
   PG_SECRET_KEY: "embedded-postgres-password"
-  # inside the pod, a sibling of PGDATA (PGDATA is usually /var/lib/postgresql/data/pgdata)
-  BACKUP_DIR: "/var/lib/postgresql/data/backups"
+  # a folder on the backup volume, shared with backup-k8s-objects (which uses /backups/k8s)
+  BACKUP_DIR: "/backups/postgres"
   KEEP_BACKUPS: "5"
-  # the volume must still be at least this percent free after the dump (it also holds the database)
-  MIN_FREE_PERCENT: "20"
+  # everything under /backups (all steps) must stay below this. Keep equal to the PVC size (250Mi).
+  BACKUP_LIMIT_MB: "250"
   MIN_BYTES: "1000"

@@ -27,14 +27,22 @@ spec:
             - |
               set -u
               CM="preflight-${RUN_ID}"
-              for t in kubectl jq base64; do
+              for t in kubectl jq base64 gzip zcat sha256sum du df; do
                 command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
               done
-              REASONS=""; POD=""; CONT=""; FILE_PATH=""; SIZE=""; SHA=""; DBSIZE=""; FREEPCT=""
+              REASONS=""; POD=""; CONT=""; FILE_PATH=""; SIZE=""; SHA=""; DBSIZE=""; USED_MB=""
               addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
-              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} db=${PG_DB} user=${PG_USER} dir=${BACKUP_DIR}"
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} db=${PG_DB} user=${PG_USER} dir=${BACKUP_DIR} limit=${BACKUP_LIMIT_MB}MB"
+
+              # runs a command in the Postgres pod. The password goes in on stdin, never on a command line.
+              pgexec() { printf '%s\n' "$PW" | kubectl -n "$POSTGRES_NAMESPACE" exec -i "$POD" -c "$CONT" -- \
+                sh -c 'IFS= read -r PGPASSWORD; export PGPASSWORD; '"$1" sh "$PG_USER" "$PG_DB"; }
 
               run_backup() {
+                # 0. the backup volume
+                [ -d /backups ] && [ -w /backups ] || { addr "/backups is not mounted or not writable (is the PVC preflight-backups there?)"; return; }
+                mkdir -p "$BACKUP_DIR" || { addr "cannot create $BACKUP_DIR"; return; }
+
                 # 1. exactly one running Postgres pod
                 PODS="$(kubectl -n "$POSTGRES_NAMESPACE" get pods -l "$POSTGRES_POD_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
                 N="$(printf '%s' "$PODS" | grep -c . || true)"
@@ -55,28 +63,43 @@ spec:
                   return
                 fi
 
-                # 3. run the dump inside the Postgres pod. The password goes in on stdin, never on a command line.
-                FILE="${PG_DB}-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
-                EXEC_OUT="$(printf '%s\n' "$PW" | kubectl -n "$POSTGRES_NAMESPACE" exec -i "$POD" -c "$CONT" -- \
-                  sh -c "$(cat /scripts/remote.sh)" sh "$BACKUP_DIR" "$PG_DB" "$PG_USER" "$FILE" "$KEEP_BACKUPS" "$MIN_FREE_PERCENT" "$MIN_BYTES" 2>&1)"
-                RC=$?
-                PW=""
-                printf '%s\n' "$EXEC_OUT" | grep -v '^RESULT_'
-                ERRS="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^ERR //p' | tr '\n' ';' | sed 's/;$//')"
-                [ -z "$ERRS" ] || addr "$ERRS"
-                [ "$RC" = "0" ] || [ -n "$ERRS" ] || addr "kubectl exec exited with code $RC"
-                [ "$RC" = "0" ] || return
-                FILE_PATH="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_FILE=//p')"
-                SIZE="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_SIZE=//p')"
-                SHA="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_SHA=//p')"
-                DBSIZE="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_DBSIZE=//p')"
-                FREEPCT="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_FREEPCT=//p')"
-                if [ -z "$FILE_PATH" ] || [ -z "$SHA" ]; then addr "the pod did not report a backup file"; return; fi
+                # 3. room on the backup volume. The database size is a safe upper bound for the compressed dump.
+                DBSIZE="$(pgexec 'psql -U "$1" -d "$2" -tAc "select pg_database_size(current_database())"' 2>/dev/null)"
+                case "$DBSIZE" in ''|*[!0-9]*) addr "cannot read the size of database $PG_DB (wrong user, password or database?)"; return ;; esac
+                NEED_KB=$(( DBSIZE / 1024 + 1 ))
+                USED_KB="$(du -sk /backups | cut -f1)"; USED_MB=$(( USED_KB / 1024 ))
+                AVAIL_KB="$(df -Pk /backups | tail -1 | awk '{print $4}')"
+                ROOM_KB=$(( BACKUP_LIMIT_MB * 1024 - USED_KB ))
+                [ "$AVAIL_KB" -ge "$ROOM_KB" ] || ROOM_KB="$AVAIL_KB"
+                echo "database ${NEED_KB} KB, backup volume used ${USED_KB} KB, room ${ROOM_KB} KB"
+                [ "$ROOM_KB" -ge "$NEED_KB" ] || { addr "not enough room on the backup volume: ${ROOM_KB} KB left under the ${BACKUP_LIMIT_MB} MB limit, the database is ${NEED_KB} KB"; return; }
 
-                # 4. look again from outside: the file is really there with that size
-                GOT="$(kubectl -n "$POSTGRES_NAMESPACE" exec "$POD" -c "$CONT" -- sh -c 'wc -c < "$1"' sh "$FILE_PATH" 2>/dev/null | tr -d ' ')"
-                [ "$GOT" = "$SIZE" ] || { addr "backup file check failed: expected $SIZE bytes in $FILE_PATH, found '${GOT:-nothing}'"; return; }
-                echo "PASS: $FILE_PATH, $SIZE bytes, sha256 $SHA"
+                # 4. dump, streamed out of the Postgres pod into the backup volume. Written as .part, renamed only when verified.
+                FILE="${PG_DB}-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+                PART="$BACKUP_DIR/$FILE.part"; ERRF="$(mktemp)"; RCF="$(mktemp)"
+                { pgexec 'exec pg_dump -U "$1" "$2"' 2>"$ERRF"; echo $? > "$RCF"; } | gzip > "$PART"
+                PW=""
+                RC="$(cat "$RCF" 2>/dev/null || echo 99)"
+                [ ! -s "$ERRF" ] || { echo "pg_dump said:"; sed 's/^/  /' "$ERRF"; }
+                [ "$RC" = "0" ] || { rm -f "$PART"; addr "pg_dump through kubectl exec failed with exit code $RC"; return; }
+                gzip -t "$PART" 2>/dev/null || { rm -f "$PART"; addr "the dump is not a valid gzip file"; return; }
+                zcat "$PART" | tail -n 5 | grep -q 'PostgreSQL database dump complete' || { rm -f "$PART"; addr "the dump has no 'PostgreSQL database dump complete' trailer, it is incomplete"; return; }
+                SIZE="$(wc -c < "$PART" | tr -d ' ')"
+                [ "$SIZE" -ge "$MIN_BYTES" ] || { rm -f "$PART"; addr "the dump is only $SIZE bytes (minimum $MIN_BYTES)"; return; }
+                mv "$PART" "$BACKUP_DIR/$FILE"
+                ( cd "$BACKUP_DIR" && sha256sum "$FILE" > "$FILE.sha256" ) || { addr "cannot write the checksum file"; return; }
+                SHA="$(cut -d' ' -f1 "$BACKUP_DIR/$FILE.sha256")"
+                FILE_PATH="$BACKUP_DIR/$FILE"
+
+                # 5. read it back from the volume: the stored file must still match its checksum
+                ( cd "$BACKUP_DIR" && sha256sum -c "$FILE.sha256" >/dev/null 2>&1 ) || { addr "read-back failed: $FILE_PATH does not match its sha256"; return; }
+
+                # 6. keep the newest KEEP_BACKUPS dumps of this database (and their checksum files)
+                ls -1t "$BACKUP_DIR"/"$PG_DB"-*.sql.gz 2>/dev/null | tail -n +$(( KEEP_BACKUPS + 1 )) | while IFS= read -r old; do
+                  rm -f "$old" "$old.sha256"; echo "pruned $old"
+                done
+                USED_MB=$(( $(du -sk /backups | cut -f1) / 1024 ))
+                echo "PASS: $FILE_PATH, $SIZE bytes, sha256 $SHA (backup volume now ${USED_MB} MB of ${BACKUP_LIMIT_MB} MB)"
               }
               run_backup
 
@@ -85,13 +108,13 @@ spec:
               kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
               kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
                 --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg pod "$POD" --arg db "$PG_DB" --arg f "$FILE_PATH" \
-                --arg sz "$SIZE" --arg sha "$SHA" --arg dbs "$DBSIZE" --arg fp "$FREEPCT" --arg r "$REASONS" --arg t "$NOW" \
-                '{data:{"backup-postgres":$s,"backup-postgres.cluster":$c,"backup-postgres.pod":$pod,"backup-postgres.database":$db,"backup-postgres.file":$f,"backup-postgres.sizeBytes":$sz,"backup-postgres.sha256":$sha,"backup-postgres.databaseBytes":$dbs,"backup-postgres.freePercentAfter":$fp,"backup-postgres.storage":"same-volume-as-database","backup-postgres.reason":$r,"backup-postgres.completedAt":$t}}')" \
+                --arg sz "$SIZE" --arg sha "$SHA" --arg dbs "$DBSIZE" --arg um "$USED_MB" --arg lm "$BACKUP_LIMIT_MB" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"backup-postgres":$s,"backup-postgres.cluster":$c,"backup-postgres.pod":$pod,"backup-postgres.database":$db,"backup-postgres.file":$f,"backup-postgres.sizeBytes":$sz,"backup-postgres.sha256":$sha,"backup-postgres.databaseBytes":$dbs,"backup-postgres.volumeUsedMB":$um,"backup-postgres.volumeLimitMB":$lm,"backup-postgres.storage":"pvc preflight-backups (same node disk on kind)","backup-postgres.reason":$r,"backup-postgres.completedAt":$t}}')" \
                 || { echo "could not write evidence"; exit 1; }
               echo "RESULT: $STATUS"
               [ "$STATUS" = "success" ] || exit 1
           volumeMounts:
-            - {name: script, mountPath: /scripts, readOnly: true}
+            - {name: backups, mountPath: /backups}
       volumes:
-        - name: script
-          configMap: {name: backup-postgres-script}
+        - name: backups
+          persistentVolumeClaim: {claimName: preflight-backups}

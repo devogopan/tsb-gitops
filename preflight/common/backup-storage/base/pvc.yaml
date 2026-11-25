@@ -1,0 +1,20 @@
+# One small backup volume per cluster. The backup Jobs (backup-postgres, backup-k8s-objects) mount it at /backups.
+# Argo CD must never prune or delete it: it holds the backups.
+#
+# SIZE: 250Mi is a demo size. On kind (local-path storage) the size is NOT enforced: the volume is a folder on the
+# node's disk. The Jobs enforce the limit themselves (BACKUP_LIMIT_MB in each step's config, keep it equal to this size).
+#
+# ACCESS: ReadWriteOnce. Two Jobs in one cluster may mount it together only if they run on the same node
+# (always true on a single-node kind cluster). On a multi-node cluster use ReadWriteMany storage or a bucket.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: preflight-backups
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 250Mi

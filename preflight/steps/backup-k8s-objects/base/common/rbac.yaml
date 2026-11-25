@@ -1,0 +1,65 @@
+# Read-only. Lists the Istio, XCP and TSB objects in every namespace, so it needs a ClusterRole.
+# The AppProject must allow ClusterRole and ClusterRoleBinding (see argocd-config/appproject-tsb.yaml).
+# Reading secret METADATA needs a Role per namespace: see clusters/<name>/secrets-rbac.yaml.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-backup-k8s-objects
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-k8s-objects-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-k8s-objects-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: backup-k8s-objects-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-backup-k8s-objects, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: preflight-backup-k8s-objects
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  # the API groups of the types in shared/config.yaml (get and list only)
+  - apiGroups:
+      - networking.istio.io
+      - security.istio.io
+      - extensions.istio.io
+      - telemetry.istio.io
+      - install.istio.io
+      - gateway.xcp.tetrate.io
+      - istiointernal.xcp.tetrate.io
+      - security.xcp.tetrate.io
+      - traffic.xcp.tetrate.io
+      - extension.xcp.tetrate.io
+      - xcp.tetrate.io
+      - install.tetrate.io
+      - kubegres.reactive-tech.io
+      - external-secrets.io
+    resources: ["*"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-backup-k8s-objects
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: preflight-backup-k8s-objects}
+subjects:
+  - {kind: ServiceAccount, name: preflight-backup-k8s-objects, namespace: preflight}
