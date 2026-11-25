@@ -36,7 +36,7 @@ spec:
               istrue() { [ "${1:-}" = "true" ]; }
               join() { tr '\n' '|' | sed 's/|$//'; }
 
-              for t in kubectl jq curl nc; do
+              for t in kubectl jq curl; do
                 command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
               done
               echo "cluster=${CLUSTER_NAME} run=${RUN_ID} mp=${CHECK_MP} cp=${CHECK_CP} allowScaledDown=${ALLOW_SCALED_DOWN} elastic=${ELASTIC_CHECK}"
