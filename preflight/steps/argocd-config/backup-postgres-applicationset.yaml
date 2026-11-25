@@ -1,0 +1,34 @@
+# One Application per folder in clusters/. Only the cluster that runs Postgres has a folder.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: preflight-backup-postgres
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        revision: main
+        directories:
+          - path: preflight/steps/backup-postgres/clusters/*
+  template:
+    metadata:
+      name: 'preflight-backup-postgres-{{path.basename}}'
+      labels:
+        app.kubernetes.io/part-of: preflight-backup-postgres
+    spec:
+      project: tsb
+      source:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        name: '{{path.basename}}'
+        namespace: preflight
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: false
+        syncOptions:
+          - ServerSideApply=true
+          - CreateNamespace=true

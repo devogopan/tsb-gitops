@@ -1,0 +1,9 @@
+# THE TRIGGER FOR ALL CLUSTERS. Edit it in a PR and the backup runs again.
+#   RUN_ID  change to re-run. Lower-case letters, digits and "-" only. Same value as the other preflight steps.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-postgres-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-008"

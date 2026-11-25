@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No "namespace:" on purpose: the Role for the database lives in tsb.
+resources:
+  - ../../base/common
+  - ../../base/job
+  - ../../shared
+  - config.yaml

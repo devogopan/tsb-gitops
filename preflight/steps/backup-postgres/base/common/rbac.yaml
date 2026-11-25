@@ -1,0 +1,54 @@
+# The Job runs in "preflight" and reaches Postgres only through the Kubernetes API (kubectl exec),
+# so TSB's NetworkPolicy does not matter and nothing runs in the "tsb" namespace.
+# If your Secret is not called postgres-credentials, change resourceNames here AND PG_SECRET in the cluster config.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-backup-postgres
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-postgres-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-postgres-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: backup-postgres-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-backup-postgres, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-postgres
+  namespace: tsb
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # exactly one Secret, by name
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["postgres-credentials"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-postgres
+  namespace: tsb
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: backup-postgres}
+subjects:
+  - {kind: ServiceAccount, name: preflight-backup-postgres, namespace: preflight}

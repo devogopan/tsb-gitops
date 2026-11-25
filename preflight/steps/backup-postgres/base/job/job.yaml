@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: backup-postgres
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-backup-postgres
+      containers:
+        - name: backup
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: backup-postgres-shared}    # shared: RUN_ID
+            - configMapRef: {name: backup-postgres-cluster}   # this cluster: pod, database, paths
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq base64; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              REASONS=""; POD=""; CONT=""; FILE_PATH=""; SIZE=""; SHA=""; DBSIZE=""; FREEPCT=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} db=${PG_DB} user=${PG_USER} dir=${BACKUP_DIR}"
+
+              run_backup() {
+                # 1. exactly one running Postgres pod
+                PODS="$(kubectl -n "$POSTGRES_NAMESPACE" get pods -l "$POSTGRES_POD_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+                N="$(printf '%s' "$PODS" | grep -c . || true)"
+                if [ "$N" != "1" ]; then addr "expected exactly one pod for selector '$POSTGRES_POD_SELECTOR' in $POSTGRES_NAMESPACE, found $N"; return; fi
+                POD="$PODS"
+                PHASE="$(kubectl -n "$POSTGRES_NAMESPACE" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null)"
+                [ "$PHASE" = "Running" ] || { addr "pod $POD is $PHASE, not Running"; return; }
+                CONT="${POSTGRES_CONTAINER:-}"
+                [ -n "$CONT" ] || CONT="$(kubectl -n "$POSTGRES_NAMESPACE" get pod "$POD" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null)"
+                [ -n "$CONT" ] || { addr "cannot read the container name of pod $POD"; return; }
+                echo "pod=$POD container=$CONT"
+
+                # 2. the password (one Secret, read by name)
+                SJSON="$(kubectl -n "$POSTGRES_NAMESPACE" get secret "$PG_SECRET" -o json 2>/dev/null)" || { addr "cannot read secret $PG_SECRET in $POSTGRES_NAMESPACE"; return; }
+                PW="$(printf '%s' "$SJSON" | jq -r --arg k "$PG_SECRET_KEY" '.data[$k] // empty' | base64 -d 2>/dev/null)"
+                if [ -z "$PW" ]; then
+                  addr "secret $PG_SECRET has no key '$PG_SECRET_KEY' (keys: $(printf '%s' "$SJSON" | jq -r '.data | keys | join(",")'))"
+                  return
+                fi
+
+                # 3. run the dump inside the Postgres pod. The password goes in on stdin, never on a command line.
+                FILE="${PG_DB}-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ).sql.gz"
+                EXEC_OUT="$(printf '%s\n' "$PW" | kubectl -n "$POSTGRES_NAMESPACE" exec -i "$POD" -c "$CONT" -- \
+                  sh -c "$(cat /scripts/remote.sh)" sh "$BACKUP_DIR" "$PG_DB" "$PG_USER" "$FILE" "$KEEP_BACKUPS" "$MIN_FREE_PERCENT" "$MIN_BYTES" 2>&1)"
+                RC=$?
+                PW=""
+                printf '%s\n' "$EXEC_OUT" | grep -v '^RESULT_'
+                ERRS="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^ERR //p' | tr '\n' ';' | sed 's/;$//')"
+                [ -z "$ERRS" ] || addr "$ERRS"
+                [ "$RC" = "0" ] || [ -n "$ERRS" ] || addr "kubectl exec exited with code $RC"
+                [ "$RC" = "0" ] || return
+                FILE_PATH="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_FILE=//p')"
+                SIZE="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_SIZE=//p')"
+                SHA="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_SHA=//p')"
+                DBSIZE="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_DBSIZE=//p')"
+                FREEPCT="$(printf '%s\n' "$EXEC_OUT" | sed -n 's/^RESULT_FREEPCT=//p')"
+                if [ -z "$FILE_PATH" ] || [ -z "$SHA" ]; then addr "the pod did not report a backup file"; return; fi
+
+                # 4. look again from outside: the file is really there with that size
+                GOT="$(kubectl -n "$POSTGRES_NAMESPACE" exec "$POD" -c "$CONT" -- sh -c 'wc -c < "$1"' sh "$FILE_PATH" 2>/dev/null | tr -d ' ')"
+                [ "$GOT" = "$SIZE" ] || { addr "backup file check failed: expected $SIZE bytes in $FILE_PATH, found '${GOT:-nothing}'"; return; }
+                echo "PASS: $FILE_PATH, $SIZE bytes, sha256 $SHA"
+              }
+              run_backup
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg pod "$POD" --arg db "$PG_DB" --arg f "$FILE_PATH" \
+                --arg sz "$SIZE" --arg sha "$SHA" --arg dbs "$DBSIZE" --arg fp "$FREEPCT" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"backup-postgres":$s,"backup-postgres.cluster":$c,"backup-postgres.pod":$pod,"backup-postgres.database":$db,"backup-postgres.file":$f,"backup-postgres.sizeBytes":$sz,"backup-postgres.sha256":$sha,"backup-postgres.databaseBytes":$dbs,"backup-postgres.freePercentAfter":$fp,"backup-postgres.storage":"same-volume-as-database","backup-postgres.reason":$r,"backup-postgres.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: script, mountPath: /scripts, readOnly: true}
+      volumes:
+        - name: script
+          configMap: {name: backup-postgres-script}
