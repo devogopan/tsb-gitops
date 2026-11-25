@@ -53,26 +53,51 @@ spec:
               SKIPPED="$(grep "doesn't have a resource type" /work/run.out | sed -n 's/.*resource type "\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//')"
               [ -z "$SKIPPED" ] || echo "WARN: resource types not installed in this cluster, so not checked: $SKIPPED"
 
-              # objects found without a content hash: kind/namespace/name
-              : > /work/objects
+              # Objects found without a content hash, as kind/namespace/name. An object that carries a finalizer
+              # listed in IGNORE_FINALIZERS (default: the TSB GitOps controller's) is known to TSB: it goes to
+              # /work/ignored, is printed and recorded, but does not fail the check. Everything else fails.
+              : > /work/objects; : > /work/ignored
               for f in /work/.cleanup-script-logs/tsb-missing-hash-*.log; do
                 [ -s "$f" ] || continue
-                awk '
-                  function emit() { if (k != "") print k "/" ns "/" n; k = ""; ns = ""; n = ""; m = 0 }
+                awk -v ign="${IGNORE_FINALIZERS:-}" -v out=/work/objects -v ig=/work/ignored '
+                  BEGIN { n = split(ign, a, " "); for (i = 1; i <= n; i++) skip[a[i]] = 1 }
+                  function emit() { if (k != "") print k "/" ns "/" nm >> (g ? ig : out); k = ""; ns = ""; nm = ""; m = 0; fin = 0; g = 0 }
                   /^---$/ { emit(); next }
                   /^kind: / { k = $2 }
                   /^metadata:/ { m = 1; next }
+                  m && /^  finalizers:/ { fin = 1; next }
+                  m && fin && /^  - / { v = $0; sub(/^  - /, "", v); if (v in skip) g = 1; next }
+                  m && /^  [A-Za-z]/ { fin = 0 }
                   m && /^  namespace: / { ns = $2 }
-                  m && /^  name: / { n = $2 }
-                  /^[a-z]/ { m = 0 }
-                  END { emit() }' "$f" >> /work/objects
+                  m && /^  name: / { nm = $2 }
+                  /^[a-z]/ { m = 0; fin = 0 }
+                  END { emit() }' "$f"
               done
               sort -u /work/objects -o /work/objects
+              sort -u /work/ignored -o /work/ignored
               MISSING="$(wc -l < /work/objects | tr -d ' ')"
+              IGNORED="$(wc -l < /work/ignored | tr -d ' ')"
               NS="$(wc -l < /work/.cleanup-script-logs/processed_namespaces.txt 2>/dev/null | tr -d ' ')"
+              if [ "$IGNORED" != "0" ]; then
+                echo "---------- $IGNORED object(s) ignored: finalizer in IGNORE_FINALIZERS (${IGNORE_FINALIZERS:-}) ----------"
+                head -20 /work/ignored
+                [ "$IGNORED" -le 20 ] || echo "... and $((IGNORED - 20)) more"
+                awk -F/ '{ c[$2]++ } END { for (n in c) print "  " c[n] " in " n }' /work/ignored | sort -rn
+                echo "----------"
+              fi
+              if [ "$MISSING" != "0" ]; then
+                echo "---------- $MISSING object(s) WITHOUT a content hash and not ignored (kind/namespace/name) ----------"
+                cat /work/objects
+                echo "---------- count per namespace ----------"
+                awk -F/ '{ c[$2]++ } END { for (n in c) print c[n], n }' /work/objects | sort -rn
+                echo "To look at one: kubectl get <kind> -n <namespace> <name> -o yaml"
+                echo "----------"
+              fi
               [ "$MISSING" = "0" ] || addr "$MISSING Istio/XCP object(s) without a content hash, do not delete them, raise with Tetrate"
               OBJ="$(head -40 /work/objects | tr '\n' '|' | sed 's/|$//')"
               [ "$MISSING" -le 40 ] || OBJ="${OBJ}|+$((MISSING - 40)) more, see the Job log"
+              IGN="$(head -40 /work/ignored | tr '\n' '|' | sed 's/|$//')"
+              [ "$IGNORED" -le 40 ] || IGN="${IGN}|+$((IGNORED - 40)) more"
 
               STATUS=success; [ -z "$REASONS" ] || STATUS=failed
               NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -80,9 +105,10 @@ spec:
               kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
                 --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg m "$MISSING" --arg o "$OBJ" --arg ns "${NS:-0}" \
                 --arg sk "$SKIPPED" --arg sha "$SHA" --arg r "$REASONS" --arg t "$NOW" \
-                '{data:{"content-hash":$s,"content-hash.cluster":$c,"content-hash.missing":$m,"content-hash.objects":$o,"content-hash.namespaces":$ns,"content-hash.skippedTypes":$sk,"content-hash.scriptSha":$sha,"content-hash.reason":$r,"content-hash.completedAt":$t}}')" \
+                --arg ig "$IGNORED" --arg il "$IGN" --arg ir "${IGNORE_FINALIZERS:-}" \
+                '{data:{"content-hash":$s,"content-hash.cluster":$c,"content-hash.missing":$m,"content-hash.objects":$o,"content-hash.ignored":$ig,"content-hash.ignoredObjects":$il,"content-hash.ignoreRule":$ir,"content-hash.namespaces":$ns,"content-hash.skippedTypes":$sk,"content-hash.scriptSha":$sha,"content-hash.reason":$r,"content-hash.completedAt":$t}}')" \
                 || { echo "could not write evidence"; exit 1; }
-              echo "SUMMARY: ${NS:-0} namespace(s) checked, $MISSING object(s) without a content hash"
+              echo "SUMMARY: ${NS:-0} namespace(s) checked, $MISSING object(s) without a content hash, $IGNORED ignored"
               echo "RESULT: $STATUS"
               [ "$STATUS" = "success" ] || exit 1
           volumeMounts:

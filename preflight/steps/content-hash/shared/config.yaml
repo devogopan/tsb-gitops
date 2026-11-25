@@ -3,6 +3,10 @@
 #
 #   RUN_ID  change to re-run. Lower-case letters, digits and "-" only.
 #           Use the same value as the other preflight steps of this attempt.
+#   IGNORE_FINALIZERS  space separated. An object WITHOUT a content hash that carries one of these finalizers
+#           is not a failure: it is listed and recorded instead. The default is the TSB GitOps controller's
+#           finalizer, which proves TSB knows the object (it applies it to TSB, see its status
+#           reason TSBApplySuccess). Empty = ignore nothing. The rule is recorded in the evidence.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,3 +14,4 @@ metadata:
   namespace: preflight
 data:
   RUN_ID: "run-008"
+  IGNORE_FINALIZERS: "gitops.tetrate.io/finalizer"
