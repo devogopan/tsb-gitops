@@ -1,0 +1,61 @@
+# READ ONLY. The demo suites only assert (get and list), so the ServiceAccount cannot change anything outside "preflight".
+# If you add a test that looks at another kind of object, add that kind here (get and list only). A test that creates objects
+# needs write rights: do not add them here without a review.
+# The AppProject must allow ClusterRole and ClusterRoleBinding (argocd-config/appproject-tsb.yaml).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-chainsaw-pre
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chainsaw-pre-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+  # the report container reads the chainsaw container's status and log
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chainsaw-pre-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: chainsaw-pre-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-chainsaw-pre, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: preflight-chainsaw-pre
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods", "services"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list"]
+  - apiGroups: ["install.tetrate.io"]
+    resources: ["managementplanes", "controlplanes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices", "gateways"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-chainsaw-pre
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: preflight-chainsaw-pre}
+subjects:
+  - {kind: ServiceAccount, name: preflight-chainsaw-pre, namespace: preflight}

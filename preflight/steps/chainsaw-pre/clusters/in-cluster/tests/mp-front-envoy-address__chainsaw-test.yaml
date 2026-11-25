@@ -1,0 +1,21 @@
+# Read only. The front envoy Service of the management plane has a load balancer address.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mp-front-envoy-address
+spec:
+  description: Service tsb/envoy has a load balancer address
+  timeouts:
+    assert: 20s
+  steps:
+    - name: service
+      try:
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: envoy
+                namespace: tsb
+              status:
+                (length(loadBalancer.ingress) >= `1`): true

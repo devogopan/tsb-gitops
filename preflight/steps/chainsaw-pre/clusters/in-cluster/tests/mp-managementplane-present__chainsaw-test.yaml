@@ -1,0 +1,20 @@
+# Read only. A ManagementPlane object exists and reports at least one installed component.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mp-managementplane-present
+spec:
+  description: The ManagementPlane object exists in tsb and has components in its status
+  timeouts:
+    assert: 20s
+  steps:
+    - name: managementplane
+      try:
+        - assert:
+            resource:
+              apiVersion: install.tetrate.io/v1alpha1
+              kind: ManagementPlane
+              metadata:
+                namespace: tsb
+              status:
+                (length(keys(components)) >= `1`): true

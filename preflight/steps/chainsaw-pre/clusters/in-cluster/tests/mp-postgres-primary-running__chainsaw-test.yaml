@@ -1,0 +1,23 @@
+# Read only. A Postgres primary pod is Running (same labels backup-postgres uses).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mp-postgres-primary-running
+spec:
+  description: A tsb Postgres pod with replicationRole=primary is Running
+  timeouts:
+    assert: 20s
+  steps:
+    - name: pod
+      try:
+        - assert:
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                namespace: tsb
+                labels:
+                  app: tsb-postgres
+                  replicationRole: primary
+              status:
+                phase: Running

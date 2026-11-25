@@ -1,0 +1,21 @@
+# Read only. The management plane operator has an available replica.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: mp-operator-available
+spec:
+  description: The management plane operator is available in tsb
+  timeouts:
+    assert: 20s
+  steps:
+    - name: operator
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: tsb-operator-management-plane
+                namespace: tsb
+              status:
+                (availableReplicas >= `1`): true

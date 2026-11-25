@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# No "namespace:" on purpose (the generated ConfigMap carries its own).
+resources:
+  - ../../base/common
+  - ../../base/job
+  - ../../shared
+  - ../../base/tests
+  - config.yaml
+# Tests that run only in THIS cluster (here: the management plane). Same naming: <test>__chainsaw-test.yaml.
+configMapGenerator:
+  - name: chainsaw-tests-cluster
+    namespace: preflight
+    options:
+      disableNameSuffixHash: true
+    files:
+      - tests/mp-operator-available__chainsaw-test.yaml
+      - tests/mp-front-envoy-address__chainsaw-test.yaml
+      - tests/mp-postgres-primary-running__chainsaw-test.yaml
+      - tests/mp-managementplane-present__chainsaw-test.yaml
+      - tests/demo-httpbin-routes-present__chainsaw-test.yaml

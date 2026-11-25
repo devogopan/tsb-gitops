@@ -1,0 +1,39 @@
+# Read only: asserts, creates nothing. The control plane operator, Istiod and the XCP edge each have an available replica.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cp-operators-available
+spec:
+  description: Control plane operator, istiod and the XCP edge are available in istio-system
+  timeouts:
+    assert: 20s
+  steps:
+    - name: deployments
+      try:
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: tsb-operator-control-plane
+                namespace: istio-system
+              status:
+                (availableReplicas >= `1`): true
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: istiod
+                namespace: istio-system
+              status:
+                (availableReplicas >= `1`): true
+        - assert:
+            resource:
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: edge
+                namespace: istio-system
+              status:
+                (availableReplicas >= `1`): true

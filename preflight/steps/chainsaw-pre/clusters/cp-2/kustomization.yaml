@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# A control-plane-only cluster runs only the common tests. Add a configMapGenerator named chainsaw-tests-cluster here
+# (see clusters/in-cluster/kustomization.yaml) to give it more. The Job treats that ConfigMap as optional.
+resources:
+  - ../../base/common
+  - ../../base/job
+  - ../../shared
+  - ../../base/tests
+  - config.yaml

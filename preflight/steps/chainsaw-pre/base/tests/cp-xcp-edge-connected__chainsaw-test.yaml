@@ -1,0 +1,24 @@
+# Read only. The ControlPlane object says the XCP edge is connected to the management plane
+# (the same field cluster-health reads: status.components.xcp.edge.connected).
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: cp-xcp-edge-connected
+spec:
+  description: The XCP edge reports connected in the ControlPlane status
+  timeouts:
+    assert: 20s
+  steps:
+    - name: edge
+      try:
+        - assert:
+            resource:
+              apiVersion: install.tetrate.io/v1alpha1
+              kind: ControlPlane
+              metadata:
+                namespace: istio-system
+              status:
+                components:
+                  xcp:
+                    edge:
+                      connected: true

@@ -1,0 +1,201 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: chainsaw-pre
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: chainsaw-pre
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-chainsaw-pre
+      initContainers:
+        # 0. A ConfigMap cannot hold folders, so each test is a file named <test>__chainsaw-test.yaml.
+        #    This turns it into /tests/<test>/chainsaw-test.yaml, which is the layout chainsaw looks for.
+        - name: prepare
+          image: docker.io/alpine/k8s:1.34.13
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              n=0
+              for d in /cm-common /cm-cluster; do
+                [ -d "$d" ] || continue
+                for f in "$d"/*__chainsaw-test.yaml; do
+                  [ -e "$f" ] || continue
+                  name="$(basename "$f")"; name="${name%%__*}"
+                  mkdir -p "/tests/$name"
+                  cp "$f" "/tests/$name/chainsaw-test.yaml"
+                  echo "test: $name"
+                  n=$(( n + 1 ))
+                done
+              done
+              echo "prepared $n test(s)"
+              [ "$n" -ge 1 ] || { echo "no tests found"; exit 1; }
+          volumeMounts:
+            - {name: tests-common, mountPath: /cm-common}
+            - {name: tests-cluster, mountPath: /cm-cluster}
+            - {name: tests, mountPath: /tests}
+      containers:
+        # 1. Chainsaw. Distroless image: no shell. READ ONLY use: --namespace makes it use an existing namespace instead of
+        #    creating a temporary one, and the tests only assert. It writes its own JSON report. It exits non-zero when a test fails.
+        - name: chainsaw
+          image: ghcr.io/kyverno/chainsaw:v0.2.12     # CHECK: pin the version you tested, and mirror it to the customer registry
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: TEST_NAMESPACE, valueFrom: {configMapKeyRef: {name: chainsaw-pre-shared, key: TEST_NAMESPACE}}}
+          args:
+            - test
+            - /tests
+            - --namespace=$(TEST_NAMESPACE)
+            - --report-format=JSON
+            - --report-name=chainsaw-report
+            - --report-path=/reports
+            - --no-color
+          volumeMounts:
+            - {name: tests, mountPath: /tests, readOnly: true}
+            - {name: reports, mountPath: /reports}
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "1000m", memory: "512Mi"}
+
+        # 2. The report container. Waits for chainsaw to finish, reads its report and log, stores both on the backup volume,
+        #    and writes the evidence. RECORD ONLY: a failed test is recorded, it does not make this step fail.
+        - name: report
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: chainsaw-pre-shared}
+            - configMapRef: {name: chainsaw-pre-cluster}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq grep awk sed sort sha256sum du df wc; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              REASONS=""; TESTS=""; PASSED=""; FAILED=""; SKIPPED=""; FAILEDNAMES=""; EXITCODE=""
+              RPT_PATH=""; RPT_SHA=""; LOG_PATH=""; LOG_SHA=""; USED_MB=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} pod=${POD_NAME} namespace=${TEST_NAMESPACE} minTests=${MIN_TESTS} dir=${BACKUP_DIR}"
+              W=/work
+
+              # copies one file to the backup volume as .part, renames it when it matches, writes and checks its sha256
+              store() {
+                src="$1"; dst="$2"
+                cp "$src" "$dst.part" || { addr "cannot copy $src to $BACKUP_DIR"; return 1; }
+                [ "$(sha256sum "$src" | cut -d' ' -f1)" = "$(sha256sum "$dst.part" | cut -d' ' -f1)" ] || { rm -f "$dst.part"; addr "the copy of $src on the backup volume does not match"; return 1; }
+                mv "$dst.part" "$dst"
+                ( cd "$BACKUP_DIR" && sha256sum "$(basename "$dst")" > "$(basename "$dst").sha256" && sha256sum -c "$(basename "$dst").sha256" >/dev/null 2>&1 ) || { addr "read-back failed for $dst"; return 1; }
+              }
+
+              run_report() {
+                [ -d /backups ] && [ -w /backups ] || { addr "/backups is not mounted or not writable (is the PVC preflight-backups there?)"; return; }
+                mkdir -p "$BACKUP_DIR" || { addr "cannot create $BACKUP_DIR"; return; }
+
+                # 1. wait for the chainsaw container to finish
+                waited=0
+                while :; do
+                  EXITCODE="$(kubectl -n preflight get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="chainsaw")].state.terminated.exitCode}' 2>/dev/null)"
+                  [ -z "$EXITCODE" ] || break
+                  [ "$waited" -lt "$WAIT_MAX_SECONDS" ] || { addr "chainsaw did not finish within ${WAIT_MAX_SECONDS}s"; return; }
+                  [ $(( waited % 30 )) -ne 0 ] || echo "waiting for chainsaw to finish (${waited}s)"
+                  sleep 3; waited=$(( waited + 3 ))
+                done
+                TREASON="$(kubectl -n preflight get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="chainsaw")].state.terminated.reason}' 2>/dev/null)"
+                echo "chainsaw finished: exit code ${EXITCODE} (${TREASON:-no reason})"
+
+                # 2. its log and its report
+                kubectl -n preflight logs "$POD_NAME" -c chainsaw > $W/chainsaw.log 2>$W/err || { addr "cannot read the chainsaw log: $(head -1 $W/err)"; return; }
+                echo "---------- chainsaw log (last 40 lines) ----------"; tail -n 40 $W/chainsaw.log; echo "----------"
+                REPORT=/reports/chainsaw-report.json
+                [ -s "$REPORT" ] || { addr "chainsaw wrote no report ($REPORT). Exit code ${EXITCODE}: the run itself probably failed, read the log above"; return; }
+                jq -e '.tests | type == "array"' "$REPORT" >/dev/null 2>&1 || { addr "the chainsaw report is not valid JSON or has no tests list"; return; }
+
+                # 3. results. A test failed when any of its operations carries an error.
+                TESTS="$(jq '.tests | length' "$REPORT")"
+                SKIPPED="$(jq '[.tests[] | select(.skipped == true)] | length' "$REPORT")"
+                FAILEDNAMES="$(jq -r '[.tests[] | select([.steps[]?.operations[]? | select(.err != null)] | length > 0) | .name] | join(",")' "$REPORT")"
+                FAILED="$(jq '[.tests[] | select([.steps[]?.operations[]? | select(.err != null)] | length > 0)] | length' "$REPORT")"
+                PASSED=$(( TESTS - FAILED - SKIPPED ))
+                echo "---------- results ----------"
+                jq -r '.tests[] | (if .skipped == true then "SKIP" elif ([.steps[]?.operations[]? | select(.err != null)] | length > 0) then "FAIL" else "PASS" end) + "  " + .name' "$REPORT" | sort
+                echo "----------"
+                echo "tests=${TESTS} passed=${PASSED} failed=${FAILED} skipped=${SKIPPED}"
+
+                [ "$TESTS" -ge "$MIN_TESTS" ] || addr "only ${TESTS} test(s) in the report (minimum ${MIN_TESTS}): the suites may not have been mounted or discovered"
+                # the exit code and the report must agree, otherwise the report cannot be trusted
+                if [ "$EXITCODE" = "0" ] && [ "$FAILED" -gt 0 ]; then addr "chainsaw exited 0 but the report has ${FAILED} failed test(s)"; fi
+                if [ "$EXITCODE" != "0" ] && [ "$FAILED" -eq 0 ]; then addr "chainsaw exited ${EXITCODE} but the report shows no failed test: the run itself had a problem, read the log above"; fi
+                [ -z "$REASONS" ] || return
+
+                # 4. room, then store the report and the log, each with a checksum
+                NEED_KB=$(( ( $(wc -c < "$REPORT") + $(wc -c < $W/chainsaw.log) ) / 1024 + 2 ))
+                USED_KB="$(du -sk /backups | cut -f1)"
+                AVAIL_KB="$(df -Pk /backups | tail -1 | awk '{print $4}')"
+                ROOM_KB=$(( BACKUP_LIMIT_MB * 1024 - USED_KB ))
+                [ "$AVAIL_KB" -ge "$ROOM_KB" ] || ROOM_KB="$AVAIL_KB"
+                echo "files ${NEED_KB} KB, backup volume used ${USED_KB} KB, room ${ROOM_KB} KB"
+                [ "$ROOM_KB" -ge "$NEED_KB" ] || { addr "not enough room on the backup volume: ${ROOM_KB} KB left under the ${BACKUP_LIMIT_MB} MB limit, the files need ${NEED_KB} KB"; return; }
+                BASE="chainsaw-${CLUSTER_NAME}-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+                store "$REPORT" "$BACKUP_DIR/$BASE.json" || return
+                store $W/chainsaw.log "$BACKUP_DIR/$BASE.log" || return
+                RPT_PATH="$BACKUP_DIR/$BASE.json"; LOG_PATH="$BACKUP_DIR/$BASE.log"
+                RPT_SHA="$(cut -d' ' -f1 "$RPT_PATH.sha256")"; LOG_SHA="$(cut -d' ' -f1 "$LOG_PATH.sha256")"
+
+                # 5. keep the newest KEEP_REPORTS runs of this cluster
+                ls -1t "$BACKUP_DIR"/chainsaw-"${CLUSTER_NAME}"-*.json 2>/dev/null | tail -n +$(( KEEP_REPORTS + 1 )) | while IFS= read -r old; do
+                  rm -f "$old" "$old.sha256" "${old%.json}.log" "${old%.json}.log.sha256"; echo "pruned $old"
+                done
+                USED_MB=$(( $(du -sk /backups | cut -f1) / 1024 ))
+                echo "RECORDED: ${TESTS} tests, ${PASSED} passed, ${FAILED} failed (${FAILEDNAMES:-none}), report ${RPT_PATH} sha256 ${RPT_SHA}"
+              }
+              run_report
+
+              # record only: "success" means the run was recorded, whatever the tests said
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg t "$TESTS" --arg p "$PASSED" --arg f "$FAILED" --arg sk "$SKIPPED" --arg fn "$FAILEDNAMES" \
+                --arg ec "$EXITCODE" --arg rp "$RPT_PATH" --arg rs "$RPT_SHA" --arg lp "$LOG_PATH" --arg ls "$LOG_SHA" --arg um "$USED_MB" --arg lm "$BACKUP_LIMIT_MB" \
+                --arg r "$REASONS" --arg at "$NOW" \
+                '{data:{"chainsaw-pre":$s,"chainsaw-pre.cluster":$c,"chainsaw-pre.tests":$t,"chainsaw-pre.passed":$p,"chainsaw-pre.failed":$f,"chainsaw-pre.skipped":$sk,"chainsaw-pre.failedTests":$fn,"chainsaw-pre.chainsawExitCode":$ec,"chainsaw-pre.report":$rp,"chainsaw-pre.reportSha256":$rs,"chainsaw-pre.log":$lp,"chainsaw-pre.logSha256":$ls,"chainsaw-pre.volumeUsedMB":$um,"chainsaw-pre.volumeLimitMB":$lm,"chainsaw-pre.storage":"pvc preflight-backups (same node disk on kind)","chainsaw-pre.reason":$r,"chainsaw-pre.completedAt":$at}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS (tests passed=${PASSED:-?} failed=${FAILED:-?})"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: backups, mountPath: /backups}
+            - {name: reports, mountPath: /reports, readOnly: true}
+            - {name: work, mountPath: /work}
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}
+      volumes:
+        - name: tests-common
+          configMap: {name: chainsaw-tests-common}
+        - name: tests-cluster
+          configMap: {name: chainsaw-tests-cluster, optional: true}
+        - name: tests
+          emptyDir: {sizeLimit: 10Mi}
+        - name: reports
+          emptyDir: {sizeLimit: 50Mi}
+        - name: work
+          emptyDir: {sizeLimit: 100Mi}
+        - name: backups
+          persistentVolumeClaim: {claimName: preflight-backups}

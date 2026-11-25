@@ -1,0 +1,12 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+# Tests that run in EVERY cluster. One file per test, named <test>__chainsaw-test.yaml. The Job's first container turns each file into
+# /tests/<test>/chainsaw-test.yaml (a ConfigMap cannot hold folders). Add a file here and list it below.
+configMapGenerator:
+  - name: chainsaw-tests-common
+    namespace: preflight
+    options:
+      disableNameSuffixHash: true
+    files:
+      - cp-operators-available__chainsaw-test.yaml
+      - cp-xcp-edge-connected__chainsaw-test.yaml

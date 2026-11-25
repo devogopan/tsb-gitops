@@ -1,0 +1,19 @@
+# Read only. DEMO ONLY: at least one VirtualService exists in app-httpbin (the demo's GitOps routes).
+# Replace it with a check of your own routes.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: demo-httpbin-routes-present
+spec:
+  description: At least one VirtualService exists in app-httpbin
+  timeouts:
+    assert: 20s
+  steps:
+    - name: routes
+      try:
+        - assert:
+            resource:
+              apiVersion: networking.istio.io/v1
+              kind: VirtualService
+              metadata:
+                namespace: app-httpbin

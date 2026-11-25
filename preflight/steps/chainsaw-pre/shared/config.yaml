@@ -1,0 +1,12 @@
+# THE TRIGGER AND THE SETTINGS FOR ALL CLUSTERS. Edit it in a PR and every cluster's suites run again.
+#   RUN_ID          change to re-run (use preflight/set-run-id.sh). Lower-case letters, digits and "-" only.
+#   TEST_NAMESPACE  chainsaw's --namespace. With it chainsaw uses this existing namespace and does NOT create a temporary one,
+#                   which is what keeps the run read only.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chainsaw-pre-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-014"
+  TEST_NAMESPACE: "preflight"
