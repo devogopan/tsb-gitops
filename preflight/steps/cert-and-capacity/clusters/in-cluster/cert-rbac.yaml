@@ -1,7 +1,7 @@
 # Reading certificates means reading Secrets, and that permission also allows reading VALUES (Kubernetes has no certificate-only
 # permission). The Job takes only the CERTIFICATE blocks out of each Secret and ConfigMap, in memory: private keys, tokens and other
 # values are never written to a file, the log or the evidence. Keep this list short. One Role per namespace, read only.
-# Must match CERT_NAMESPACES in config.yaml.
+# Must match CERT_NAMESPACES in config.yaml (tsb, istio-system, tier2).
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -37,6 +37,25 @@ kind: RoleBinding
 metadata:
   name: cert-and-capacity-read
   namespace: istio-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cert-and-capacity-read}
+subjects:
+  - {kind: ServiceAccount, name: preflight-cert-and-capacity, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cert-and-capacity-read
+  namespace: tier2
+rules:
+  - apiGroups: [""]
+    resources: ["secrets", "configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cert-and-capacity-read
+  namespace: tier2
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cert-and-capacity-read}
 subjects:
   - {kind: ServiceAccount, name: preflight-cert-and-capacity, namespace: preflight}

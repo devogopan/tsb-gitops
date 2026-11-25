@@ -17,7 +17,7 @@ metadata:
   namespace: preflight
 data:
   CLUSTER_NAME: "in-cluster"
-  CERT_NAMESPACES: "tsb istio-system"
+  CERT_NAMESPACES: "tsb istio-system tier2"
   MIN_CERTS: "1"
   POSTGRES_CHECK: "true"
   POSTGRES_NAMESPACE: "tsb"
