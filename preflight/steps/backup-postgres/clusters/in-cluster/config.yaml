@@ -20,7 +20,8 @@ data:
   PG_USER: "tsb"
   PG_DB: "tsb"
   PG_SECRET: "postgres-credentials"
-  PG_SECRET_KEY: "password"
+  # the Secret has these keys: .pg_service.conf, config.yaml, embedded-postgres-password
+  PG_SECRET_KEY: "embedded-postgres-password"
   # inside the pod, a sibling of PGDATA (PGDATA is usually /var/lib/postgresql/data/pgdata)
   BACKUP_DIR: "/var/lib/postgresql/data/backups"
   KEEP_BACKUPS: "5"
