@@ -5,7 +5,7 @@ resources:
   - secretstore.yaml
   - externalsecrets.yaml
   - rbac.yaml
-  - config.yaml
+  - shared/config.yaml
   - job.yaml
 # Single source of truth for the version: config.yaml TSB_VERSION
 # sets the tctl image tag, so a version bump is a one-line change.
