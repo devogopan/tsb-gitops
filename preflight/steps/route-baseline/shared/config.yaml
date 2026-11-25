@@ -1,0 +1,18 @@
+# THE TRIGGER AND THE CHECKER SETTINGS FOR ALL CLUSTERS. Edit it in a PR and every cluster's baseline runs again.
+#   RUN_ID               change to re-run (use preflight/set-run-id.sh). Lower-case letters, digits and "-" only.
+#                        It is also the first column of every CSV line, so the report can pick the CSV out of the log.
+#   SCRAPE_WAIT_SECONDS  the checker keeps serving /metrics this long after the checks so Prometheus can scrape (120).
+#                        The report container waits for the checker to finish, so the Job lasts at least this long.
+#   CONCURRENCY, TIMEOUT checker settings (--concurrency, --timeout)
+#   NAMESPACE_PREFIX     used only when ROUTE_NAMESPACES (per cluster) is empty: every namespace starting with it is checked
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: route-baseline-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-014"
+  SCRAPE_WAIT_SECONDS: "120"
+  CONCURRENCY: "100"
+  TIMEOUT: "30s"
+  NAMESPACE_PREFIX: "envoy"

@@ -1,0 +1,53 @@
+# Read-only. The checker lists VirtualServices (and, with BYPASS_LB, Services and pods) in the routed namespaces,
+# so it needs a ClusterRole. The AppProject must allow ClusterRole and ClusterRoleBinding (argocd-config/appproject-tsb.yaml).
+# The second container reads the checker's log (pods/log) and writes the evidence ConfigMap, both only in preflight.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-route-baseline
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: route-baseline-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: route-baseline-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: route-baseline-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-route-baseline, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: preflight-route-baseline
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "services", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.istio.io"]
+    resources: ["virtualservices"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-route-baseline
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: preflight-route-baseline}
+subjects:
+  - {kind: ServiceAccount, name: preflight-route-baseline, namespace: preflight}

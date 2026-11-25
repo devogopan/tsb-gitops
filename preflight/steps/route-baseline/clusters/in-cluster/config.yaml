@@ -1,0 +1,24 @@
+# Settings for ONE cluster. The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+#   ROUTE_NAMESPACES  comma separated namespaces whose VirtualServices are checked (--namespace). Empty = use NAMESPACE_PREFIX.
+#                     CHECK: set this to the namespaces that hold your VirtualServices (the demo's are in app-httpbin).
+#   BYPASS_LB         "true" connects to the node and NodePort of a ready gateway pod of the SAME namespace (--bypass-lb).
+#                     "false" connects to the route hostname, which must resolve from inside the cluster.
+#   BACKUP_DIR        a folder on the backup volume (PVC preflight-backups)
+#   KEEP_BASELINES    newest runs to keep per cluster (each run = one .csv and one .log, each with a .sha256)
+#   BACKUP_LIMIT_MB   everything under /backups (all steps) must stay below this. Keep equal to the PVC size (250Mi).
+#   MIN_ROUTES        fewer checked routes than this fails the step
+#   WAIT_MAX_SECONDS  how long the report container waits for the checker to finish (checks + SCRAPE_WAIT_SECONDS)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: route-baseline-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "in-cluster"
+  ROUTE_NAMESPACES: "app-httpbin"
+  BYPASS_LB: "false"
+  BACKUP_DIR: "/backups/routes"
+  KEEP_BASELINES: "10"
+  BACKUP_LIMIT_MB: "250"
+  MIN_ROUTES: "1"
+  WAIT_MAX_SECONDS: "900"

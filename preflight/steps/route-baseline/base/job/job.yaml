@@ -1,0 +1,183 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: route-baseline
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: route-baseline
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-route-baseline
+      # Route hostnames are FQDNs; ndots:1 resolves them directly instead of trying every search domain first.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
+      containers:
+        # 1. The route checker (t1-route-checker, Go v2). Distroless image: no shell, no kubectl.
+        #    CSV goes to stdout, the summary to stderr. After the checks it serves /metrics for SCRAPE_WAIT_SECONDS.
+        - name: checker
+          image: devogopan/validate-routes:v2.0.1-go     # CHECK: mirror to the customer registry and pin by digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {containerPort: 8000, name: metrics}
+          env:
+            - {name: RUN_ID, valueFrom: {configMapKeyRef: {name: route-baseline-shared, key: RUN_ID}}}
+            - {name: SCRAPE_WAIT_SECONDS, valueFrom: {configMapKeyRef: {name: route-baseline-shared, key: SCRAPE_WAIT_SECONDS}}}
+            - {name: CONCURRENCY, valueFrom: {configMapKeyRef: {name: route-baseline-shared, key: CONCURRENCY}}}
+            - {name: TIMEOUT, valueFrom: {configMapKeyRef: {name: route-baseline-shared, key: TIMEOUT}}}
+            - {name: NAMESPACE_PREFIX, valueFrom: {configMapKeyRef: {name: route-baseline-shared, key: NAMESPACE_PREFIX}}}
+            - {name: ROUTE_NAMESPACES, valueFrom: {configMapKeyRef: {name: route-baseline-cluster, key: ROUTE_NAMESPACES}}}
+            - {name: BYPASS_LB, valueFrom: {configMapKeyRef: {name: route-baseline-cluster, key: BYPASS_LB}}}
+          args:
+            - "--concurrency=$(CONCURRENCY)"
+            - "--timeout=$(TIMEOUT)"
+            - "--namespace=$(ROUTE_NAMESPACES)"
+            - "--namespace-prefix=$(NAMESPACE_PREFIX)"
+            - "--bypass-lb=$(BYPASS_LB)"
+            - "--csv-extended"
+          resources:
+            requests: {cpu: "128m", memory: "256Mi"}
+            limits: {cpu: "1000m", memory: "1Gi"}
+
+        # 2. The report container. Waits for the checker to finish, reads its log, stores the CSV and the log on the
+        #    backup volume, and writes the evidence. It never changes anything in the routed namespaces.
+        - name: report
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: route-baseline-shared}
+            - configMapRef: {name: route-baseline-cluster}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq grep awk sed sort uniq sha256sum du df wc; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              REASONS=""; ROUTES=""; FAILED=""; COUNTS=""; SKIPPED=""; NSLIST=""; WARNS=""
+              CSV_PATH=""; CSV_SHA=""; LOG_PATH=""; LOG_SHA=""; USED_MB=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} pod=${POD_NAME} namespaces='${ROUTE_NAMESPACES}' prefix=${NAMESPACE_PREFIX} bypass=${BYPASS_LB} dir=${BACKUP_DIR}"
+              W=/work
+
+              # copies one file to the backup volume as .part, renames it when it matches, writes and checks its sha256
+              store() {
+                src="$1"; dst="$2"
+                cp "$src" "$dst.part" || { addr "cannot copy $src to $BACKUP_DIR"; return 1; }
+                [ "$(sha256sum "$src" | cut -d' ' -f1)" = "$(sha256sum "$dst.part" | cut -d' ' -f1)" ] || { rm -f "$dst.part"; addr "the copy of $src on the backup volume does not match"; return 1; }
+                mv "$dst.part" "$dst"
+                ( cd "$BACKUP_DIR" && sha256sum "$(basename "$dst")" > "$(basename "$dst").sha256" && sha256sum -c "$(basename "$dst").sha256" >/dev/null 2>&1 ) || { addr "read-back failed for $dst"; return 1; }
+              }
+
+              run_report() {
+                [ -d /backups ] && [ -w /backups ] || { addr "/backups is not mounted or not writable (is the PVC preflight-backups there?)"; return; }
+                mkdir -p "$BACKUP_DIR" || { addr "cannot create $BACKUP_DIR"; return; }
+
+                # 1. wait for the checker container to finish (checks, then SCRAPE_WAIT_SECONDS for Prometheus)
+                waited=0; EXITCODE=""
+                while :; do
+                  EXITCODE="$(kubectl -n preflight get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="checker")].state.terminated.exitCode}' 2>/dev/null)"
+                  [ -z "$EXITCODE" ] || break
+                  [ "$waited" -lt "$WAIT_MAX_SECONDS" ] || { addr "the checker did not finish within ${WAIT_MAX_SECONDS}s"; return; }
+                  [ $(( waited % 30 )) -ne 0 ] || echo "waiting for the checker to finish (${waited}s)"
+                  sleep 5; waited=$(( waited + 5 ))
+                done
+                TREASON="$(kubectl -n preflight get pod "$POD_NAME" -o jsonpath='{.status.containerStatuses[?(@.name=="checker")].state.terminated.reason}' 2>/dev/null)"
+                echo "checker finished: exit code ${EXITCODE} (${TREASON:-no reason})"
+
+                # 2. read its log: CSV lines (stdout) and the summary and warnings (stderr) are mixed in it
+                kubectl -n preflight logs "$POD_NAME" -c checker > $W/checker.log 2>$W/err || { addr "cannot read the checker log: $(head -1 $W/err)"; return; }
+                grep -v "^${RUN_ID}," $W/checker.log > $W/other.log || true
+                if [ "$EXITCODE" != "0" ]; then
+                  echo "checker output (not CSV):"; tail -n 10 $W/other.log | sed 's/^/  /'
+                  HINT=""; [ "$EXITCODE" != "1" ] || HINT=" (exit 1 = no namespaces or no routes to check, see the output above)"
+                  addr "the checker exited with code ${EXITCODE} (${TREASON:-no reason})${HINT}"
+                  return
+                fi
+
+                # 3. CSV: run_id,namespace,hostname,status,type,path,port
+                awk -F, -v r="$RUN_ID" '$1 == r && NF == 7 && $4 ~ /^[0-9]+$/' $W/checker.log > $W/routes.csv
+                ROUTES="$(wc -l < $W/routes.csv | tr -d ' ')"
+                PREFIXED="$(grep -c "^${RUN_ID}," $W/checker.log || true)"
+                CHECKED="$(sed -n 's/^Checked \([0-9][0-9]*\) routes.*/\1/p' $W/other.log | tail -1)"
+                COUNTS="$(sed -n 's/^Status counts: \(.*\) (failed=[0-9]*)$/\1/p' $W/other.log | tail -1)"
+                FAILED="$(sed -n 's/^Status counts: .*(failed=\([0-9]*\))$/\1/p' $W/other.log | tail -1)"
+                SKIPPED="$(sed -n 's/^Skipped: //p' $W/other.log | tail -1)"
+                NOTCHECKED="$(sed -n 's/^Namespaces not checked.*: //p' $W/other.log | tail -1)"
+                WARNS="$(grep -cE 'level=(WARN|ERROR)' $W/other.log || true)"
+                NSLIST="$(awk -F, '{ print $2 }' $W/routes.csv | sort | uniq -c | awk '{ printf "%s%s=%s", (NR > 1 ? " " : ""), $2, $1 }')"
+                echo "routes in CSV=${ROUTES} checked per summary=${CHECKED:-none} failed=${FAILED:-?} counts: ${COUNTS:-none}"
+                [ -z "$SKIPPED" ] || echo "skipped: $SKIPPED"
+                [ "$WARNS" = "0" ] || { echo "checker warnings:"; grep -E 'level=(WARN|ERROR)' $W/other.log | head -n 5 | sed 's/^/  /'; }
+
+                [ -n "$CHECKED" ] || { addr "the checker log has no 'Checked N routes' summary line"; return; }
+                [ "$PREFIXED" = "$ROUTES" ] || addr "$(( PREFIXED - ROUTES )) line(s) start with ${RUN_ID}, but are not valid CSV"
+                [ "$ROUTES" = "$CHECKED" ] || addr "the CSV has ${ROUTES} lines, but the summary says ${CHECKED} routes were checked"
+                [ "$ROUTES" -ge "$MIN_ROUTES" ] || addr "only ${ROUTES} routes were checked (minimum ${MIN_ROUTES})"
+                [ -z "$NOTCHECKED" ] || addr "VirtualServices could not be listed in: ${NOTCHECKED}"
+                [ -z "$REASONS" ] || return
+
+                # 4. room on the backup volume (everything under /backups counts against BACKUP_LIMIT_MB)
+                NEED_KB=$(( ( $(wc -c < $W/routes.csv) + $(wc -c < $W/checker.log) ) / 1024 + 2 ))
+                USED_KB="$(du -sk /backups | cut -f1)"
+                AVAIL_KB="$(df -Pk /backups | tail -1 | awk '{print $4}')"
+                ROOM_KB=$(( BACKUP_LIMIT_MB * 1024 - USED_KB ))
+                [ "$AVAIL_KB" -ge "$ROOM_KB" ] || ROOM_KB="$AVAIL_KB"
+                echo "files ${NEED_KB} KB, backup volume used ${USED_KB} KB, room ${ROOM_KB} KB"
+                [ "$ROOM_KB" -ge "$NEED_KB" ] || { addr "not enough room on the backup volume: ${ROOM_KB} KB left under the ${BACKUP_LIMIT_MB} MB limit, the files need ${NEED_KB} KB"; return; }
+
+                # 5. store the CSV and the full checker log, each with a checksum
+                BASE="routes-${CLUSTER_NAME}-${RUN_ID}-$(date -u +%Y%m%dT%H%M%SZ)"
+                store $W/routes.csv "$BACKUP_DIR/$BASE.csv" || return
+                store $W/checker.log "$BACKUP_DIR/$BASE.log" || return
+                CSV_PATH="$BACKUP_DIR/$BASE.csv"; LOG_PATH="$BACKUP_DIR/$BASE.log"
+                CSV_SHA="$(cut -d' ' -f1 "$CSV_PATH.sha256")"; LOG_SHA="$(cut -d' ' -f1 "$LOG_PATH.sha256")"
+
+                # 6. keep the newest KEEP_BASELINES runs of this cluster (csv and log with their checksums)
+                ls -1t "$BACKUP_DIR"/routes-"${CLUSTER_NAME}"-*.csv 2>/dev/null | tail -n +$(( KEEP_BASELINES + 1 )) | while IFS= read -r old; do
+                  rm -f "$old" "$old.sha256" "${old%.csv}.log" "${old%.csv}.log.sha256"; echo "pruned $old"
+                done
+                USED_MB=$(( $(du -sk /backups | cut -f1) / 1024 ))
+                echo "PASS: ${ROUTES} routes (${COUNTS}), failed=${FAILED}, csv ${CSV_PATH} sha256 ${CSV_SHA}, log ${LOG_PATH} (backup volume now ${USED_MB} MB of ${BACKUP_LIMIT_MB} MB)"
+              }
+              run_report
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg ns "$NSLIST" --arg byp "$BYPASS_LB" --arg ro "$ROUTES" --arg fa "$FAILED" \
+                --arg co "$COUNTS" --arg sk "$SKIPPED" --arg wa "$WARNS" --arg cp "$CSV_PATH" --arg cs "$CSV_SHA" --arg lp "$LOG_PATH" --arg ls "$LOG_SHA" \
+                --arg um "$USED_MB" --arg lm "$BACKUP_LIMIT_MB" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"route-baseline":$s,"route-baseline.cluster":$c,"route-baseline.namespaces":$ns,"route-baseline.bypassLb":$byp,"route-baseline.routes":$ro,"route-baseline.failed":$fa,"route-baseline.statusCounts":$co,"route-baseline.skipped":$sk,"route-baseline.checkerWarnings":$wa,"route-baseline.csv":$cp,"route-baseline.csvSha256":$cs,"route-baseline.log":$lp,"route-baseline.logSha256":$ls,"route-baseline.volumeUsedMB":$um,"route-baseline.volumeLimitMB":$lm,"route-baseline.storage":"pvc preflight-backups (same node disk on kind)","route-baseline.reason":$r,"route-baseline.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: backups, mountPath: /backups}
+            - {name: work, mountPath: /work}
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}
+      volumes:
+        - name: backups
+          persistentVolumeClaim: {claimName: preflight-backups}
+        - name: work
+          emptyDir: {sizeLimit: 1Gi}
