@@ -1,0 +1,21 @@
+# THE TRIGGER AND THE THRESHOLDS FOR ALL CLUSTERS. Edit it in a PR and every cluster's check runs again.
+#   RUN_ID         change to re-run (use preflight/set-run-id.sh). Lower-case letters, digits and "-" only.
+#   MIN_DAYS       a certificate that expires within this many days (or already has) FAILS the step. Set it to cover the
+#                  upgrade window plus the time to fix a problem.
+#   WARN_DAYS      a certificate that expires within this many days is a warning (recorded, does not fail)
+#   ELASTIC_CHECK  "skip" = Elasticsearch disk is not checked (recorded as a warning). Any other value FAILS the step,
+#                  because the Elasticsearch disk check is not built yet.
+#   GATEWAY_CRD_REGEX  picks the gateway install types out of the cluster's CRD names, like
+#                  `kubectl get crd | grep install | grep gateways`. The namespaces of their objects must all be in
+#                  CERT_NAMESPACES (per cluster), or the step fails.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-and-capacity-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-014"
+  MIN_DAYS: "30"
+  WARN_DAYS: "90"
+  ELASTIC_CHECK: "skip"
+  GATEWAY_CRD_REGEX: '^[a-z0-9-]*gateways\.install\.'

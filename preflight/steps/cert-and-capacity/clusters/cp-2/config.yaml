@@ -1,0 +1,20 @@
+# Settings for ONE cluster. The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+# A control-plane-only cluster has no Postgres, so POSTGRES_CHECK is "false".
+# CERT_NAMESPACES: istio-system and every namespace where an Istio gateway runs here. EACH needs a Role in cert-rbac.yaml.
+# CHECK: the step lists the gateway namespaces it finds. If one is missing here it FAILS and names it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-and-capacity-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "cp-2"
+  CERT_NAMESPACES: "istio-system"
+  MIN_CERTS: "1"
+  POSTGRES_CHECK: "false"
+  POSTGRES_NAMESPACE: ""
+  POSTGRES_POD_SELECTOR: ""
+  POSTGRES_CONTAINER: ""
+  POSTGRES_DATA_DIR: ""
+  MIN_FREE_PCT: "20"
+  MIN_FREE_MB: "1024"

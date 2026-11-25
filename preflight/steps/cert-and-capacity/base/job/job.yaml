@@ -1,0 +1,148 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cert-and-capacity
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-cert-and-capacity
+      containers:
+        - name: check
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: cert-and-capacity-shared}    # shared: RUN_ID, thresholds
+            - configMapRef: {name: cert-and-capacity-cluster}   # this cluster: namespaces, Postgres
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq openssl base64 awk grep sed sort; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              REASONS=""; WARNINGS=""; NCERT=0; NEXP=0; NWARN=0; NFAIL=0; SCANNED=""; GWNS=""
+              PGFREE_MB=""; PGFREE_PCT=""; PGPOD=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              warn() { WARNINGS="${WARNINGS:+$WARNINGS|}$1"; echo "WARN: $1"; }
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} namespaces='${CERT_NAMESPACES}' minDays=${MIN_DAYS} warnDays=${WARN_DAYS} postgres=${POSTGRES_CHECK}"
+              W=/work; TAB="$(printf '\t')"; MIN_S=$(( MIN_DAYS * 86400 )); WARN_S=$(( WARN_DAYS * 86400 ))
+              : > $W/certs.txt; SEEN=""
+
+              # ---- 1. the gateway namespaces must all be covered by CERT_NAMESPACES -------------------------------------------
+              # The gateway types come from the CRDs of this cluster: names like <something>gateways.install.<group>
+              CRDS="$(kubectl get crd -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>$W/err)" || { addr "cannot list the CustomResourceDefinitions: $(head -1 $W/err)"; CRDS=""; }
+              GWTYPES="$(printf '%s\n' "$CRDS" | grep -E "$GATEWAY_CRD_REGEX" | tr '\n' ' ' || true)"
+              echo "gateway install types (CRDs matching ${GATEWAY_CRD_REGEX}): ${GWTYPES:-none}"
+              for t in $GWTYPES; do
+                NSL="$(kubectl get "$t" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>$W/err)" || { addr "cannot list $t: $(head -1 $W/err)"; continue; }
+                for g in $NSL; do
+                  case " $GWNS " in *" $g "*) ;; *) GWNS="${GWNS:+$GWNS }$g" ;; esac
+                  case " $CERT_NAMESPACES " in *" $g "*) ;; *) addr "gateway namespace $g (from $t) is not in CERT_NAMESPACES: add it to config.yaml and cert-rbac.yaml" ;; esac
+                done
+              done
+              if [ -n "$GWNS" ]; then echo "gateway namespaces found: $GWNS"; else warn "no gateway install objects found (types: ${GWTYPES:-none}), so no gateway namespace was checked for coverage"; fi
+
+              # ---- 2. certificates ---------------------------------------------------------------------------------------------
+              # Only CERTIFICATE blocks leave jq. Secrets are held in a shell variable, never written to a file.
+              JQ_CERTS='.items[] | . as $o | ($o.data // {}) | to_entries[] | . as $e
+                | ((if $dec then (try ($e.value | @base64d) catch "") else $e.value end)
+                   | [match("-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----"; "g").string]) as $c
+                | range(0; ($c | length)) as $i
+                | [$o.metadata.namespace, $o.metadata.name, ($e.key + "#" + ($i | tostring)), ($c[$i] | @base64)] | @tsv'
+
+              scan() { # kind, jq decode flag, namespace
+                kind="$1"; dec="$2"; ns="$3"
+                JSON="$(kubectl -n "$ns" get "$kind" -o json 2>$W/err)" || { addr "cannot read $kind in namespace $ns: $(head -1 $W/err)"; return; }
+                printf '%s' "$JSON" | jq -r --argjson dec "$dec" "$JQ_CERTS" > $W/found.tsv 2>$W/err || { addr "cannot read certificates from $kind in $ns: $(head -1 $W/err)"; JSON=""; return; }
+                JSON=""
+                while IFS="$TAB" read -r cns cname ckey cb64; do
+                  printf '%s' "$cb64" | base64 -d > $W/one.pem 2>/dev/null
+                  loc="$kind/$cns/$cname:$ckey"
+                  SUBJ="$(openssl x509 -in $W/one.pem -noout -subject 2>/dev/null)" || { addr "cannot parse the certificate at $loc"; continue; }
+                  FP="$(openssl x509 -in $W/one.pem -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')"
+                  case " $SEEN " in *" $FP "*) continue ;; esac     # the same certificate in several places counts once
+                  SEEN="$SEEN $FP"
+                  END="$(openssl x509 -in $W/one.pem -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+                  NCERT=$(( NCERT + 1 ))
+                  if ! openssl x509 -in $W/one.pem -noout -checkend 0 >/dev/null 2>&1; then
+                    ST=EXPIRED; NEXP=$(( NEXP + 1 ))
+                    addr "certificate EXPIRED: $loc ($SUBJ) notAfter $END"
+                  elif ! openssl x509 -in $W/one.pem -noout -checkend "$MIN_S" >/dev/null 2>&1; then
+                    ST=FAIL; NFAIL=$(( NFAIL + 1 ))
+                    addr "certificate expires within ${MIN_DAYS} days: $loc ($SUBJ) notAfter $END"
+                  elif ! openssl x509 -in $W/one.pem -noout -checkend "$WARN_S" >/dev/null 2>&1; then
+                    ST=WARN; NWARN=$(( NWARN + 1 ))
+                    warn "certificate expires within ${WARN_DAYS} days: $loc ($SUBJ) notAfter $END"
+                  else ST=ok; fi
+                  echo "$ST|$loc|$SUBJ|notAfter $END" >> $W/certs.txt
+                done < $W/found.tsv
+              }
+
+              for ns in $CERT_NAMESPACES; do
+                kubectl get namespace "$ns" >/dev/null 2>&1 || { addr "namespace $ns (in CERT_NAMESPACES) does not exist"; continue; }
+                SCANNED="${SCANNED:+$SCANNED }$ns"
+                scan secrets true "$ns"
+                scan configmaps false "$ns"
+              done
+              echo "---------- certificates (distinct, ${NCERT}) ----------"
+              sort $W/certs.txt | head -n 300
+              echo "----------"
+              [ "$NCERT" -ge "${MIN_CERTS:-1}" ] || addr "only ${NCERT} certificate(s) found in: ${SCANNED:-no namespace} (minimum ${MIN_CERTS:-1}). The scan may not have read what it should"
+
+              # ---- 3. capacity: Postgres data volume (the cluster that runs Postgres) ---------------------------------------------
+              if [ "${POSTGRES_CHECK}" = "true" ]; then
+                PGPOD="$(kubectl -n "$POSTGRES_NAMESPACE" get pods -l "$POSTGRES_POD_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+                N="$(printf '%s' "$PGPOD" | grep -c . || true)"
+                if [ "$N" != "1" ]; then addr "postgres: expected exactly one pod for selector '$POSTGRES_POD_SELECTOR' in $POSTGRES_NAMESPACE, found $N"; PGPOD=""
+                else
+                  PGC="${POSTGRES_CONTAINER:-}"
+                  [ -n "$PGC" ] || PGC="$(kubectl -n "$POSTGRES_NAMESPACE" get pod "$PGPOD" -o jsonpath='{.spec.containers[0].name}' 2>/dev/null)"
+                  DFL="$(kubectl -n "$POSTGRES_NAMESPACE" exec "$PGPOD" -c "$PGC" -- df -Pk "$POSTGRES_DATA_DIR" 2>$W/err | tail -1)"
+                  TOTAL_KB="$(printf '%s' "$DFL" | awk '{print $2}')"; AVAIL_KB="$(printf '%s' "$DFL" | awk '{print $4}')"
+                  case "$TOTAL_KB$AVAIL_KB" in ''|*[!0-9]*) addr "postgres: cannot read free space of $POSTGRES_DATA_DIR in pod $PGPOD ($(head -1 $W/err))" ;;
+                  *)
+                    PGFREE_MB=$(( AVAIL_KB / 1024 )); PGFREE_PCT=$(( AVAIL_KB * 100 / TOTAL_KB ))
+                    echo "postgres $PGPOD:$POSTGRES_DATA_DIR free ${PGFREE_MB} MB (${PGFREE_PCT}%) of $(( TOTAL_KB / 1024 )) MB"
+                    [ "$PGFREE_PCT" -ge "$MIN_FREE_PCT" ] || addr "postgres data volume has ${PGFREE_PCT}% free, minimum ${MIN_FREE_PCT}%"
+                    [ "$PGFREE_MB" -ge "$MIN_FREE_MB" ] || addr "postgres data volume has ${PGFREE_MB} MB free, minimum ${MIN_FREE_MB} MB" ;;
+                  esac
+                fi
+              else
+                echo "postgres: not on this cluster (POSTGRES_CHECK=${POSTGRES_CHECK})"
+              fi
+
+              # ---- 4. Elasticsearch disk: not built. Only an explicit skip is accepted. -------------------------------------------
+              if [ "${ELASTIC_CHECK}" = "skip" ]; then warn "elasticsearch disk: NOT CHECKED (ELASTIC_CHECK=skip)"
+              else addr "ELASTIC_CHECK=${ELASTIC_CHECK}: the Elasticsearch disk check is not built, set it to skip"; fi
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              EXPIRING="$(grep -E '^(EXPIRED|FAIL|WARN)\|' $W/certs.txt | sort | cut -d'|' -f1,2,4 | head -n 20 | paste -sd';' -)"
+              echo "SUMMARY: ${NCERT} certificate(s), ${NEXP} expired, ${NFAIL} within ${MIN_DAYS} days, ${NWARN} within ${WARN_DAYS} days"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg ns "$SCANNED" --arg gw "$GWNS" --arg gt "$GWTYPES" --arg n "$NCERT" --arg e "$NEXP" --arg f "$NFAIL" --arg w "$NWARN" \
+                --arg md "$MIN_DAYS" --arg wd "$WARN_DAYS" --arg ex "$EXPIRING" --arg pf "$PGFREE_MB" --arg pp "$PGFREE_PCT" --arg pod "$PGPOD" \
+                --arg wa "$WARNINGS" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"cert-and-capacity":$s,"cert-and-capacity.cluster":$c,"cert-and-capacity.namespacesScanned":$ns,"cert-and-capacity.gatewayNamespaces":$gw,"cert-and-capacity.gatewayTypes":$gt,"cert-and-capacity.certificates":$n,"cert-and-capacity.expired":$e,"cert-and-capacity.withinMinDays":$f,"cert-and-capacity.withinWarnDays":$w,"cert-and-capacity.minDays":$md,"cert-and-capacity.warnDays":$wd,"cert-and-capacity.attention":$ex,"cert-and-capacity.postgresPod":$pod,"cert-and-capacity.postgresFreeMB":$pf,"cert-and-capacity.postgresFreePercent":$pp,"cert-and-capacity.elasticsearch":"not checked","cert-and-capacity.warnings":$wa,"cert-and-capacity.reason":$r,"cert-and-capacity.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: work, mountPath: /work}
+          resources:
+            requests: {cpu: "50m", memory: "64Mi"}
+            limits: {cpu: "500m", memory: "512Mi"}
+      volumes:
+        - name: work
+          emptyDir: {sizeLimit: 100Mi}

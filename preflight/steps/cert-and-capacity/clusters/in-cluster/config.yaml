@@ -1,0 +1,28 @@
+# Settings for ONE cluster. The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+#   CERT_NAMESPACES   namespaces whose Secrets and ConfigMaps are scanned for certificates: tsb, istio-system and every
+#                     namespace where an Istio gateway runs. EACH needs a Role in cert-rbac.yaml.
+#                     CHECK: the step lists the gateway namespaces it finds (from the gateway install CRDs, GATEWAY_CRD_REGEX). If one is missing here it FAILS
+#                     and names it. Add it here and in cert-rbac.yaml.
+#   MIN_CERTS         fewer distinct certificates found than this fails the step (proves the scan really read something)
+#   POSTGRES_CHECK    "true" on the cluster that runs Postgres (the management plane). Reads free space of its data volume
+#                     with `kubectl exec ... df`. Needs postgres-rbac.yaml.
+#   POSTGRES_*        same selector and container as backup-postgres
+#   POSTGRES_DATA_DIR a folder on the Postgres data volume
+#   MIN_FREE_PCT      free space below this percent FAILS
+#   MIN_FREE_MB       free space below this many MB FAILS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-and-capacity-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "in-cluster"
+  CERT_NAMESPACES: "tsb istio-system"
+  MIN_CERTS: "1"
+  POSTGRES_CHECK: "true"
+  POSTGRES_NAMESPACE: "tsb"
+  POSTGRES_POD_SELECTOR: "app=tsb-postgres,replicationRole=primary"
+  POSTGRES_CONTAINER: ""
+  POSTGRES_DATA_DIR: "/var/lib/postgresql/data"
+  MIN_FREE_PCT: "20"
+  MIN_FREE_MB: "1024"

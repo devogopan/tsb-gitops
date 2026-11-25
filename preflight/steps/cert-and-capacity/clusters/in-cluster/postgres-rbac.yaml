@@ -1,0 +1,23 @@
+# Free space of the Postgres data volume is read with `kubectl exec <pod> -- df`. That needs pods/exec in tsb.
+# (Kubernetes cannot name pods that change on failover, so this is every pod in tsb. See BackupPostgres-Setup.md, known limits.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cert-and-capacity-postgres
+  namespace: tsb
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cert-and-capacity-postgres
+  namespace: tsb
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: cert-and-capacity-postgres}
+subjects:
+  - {kind: ServiceAccount, name: preflight-cert-and-capacity, namespace: preflight}
