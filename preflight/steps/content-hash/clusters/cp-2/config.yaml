@@ -1,0 +1,9 @@
+# Settings for ONE cluster. The folder name must be the cluster's NAME in Argo CD (`argocd cluster list`).
+# Run it on EVERY cluster (management plane and control planes): the PDF step says "All Clusters".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: content-hash-cluster
+  namespace: preflight
+data:
+  CLUSTER_NAME: "cp-2"

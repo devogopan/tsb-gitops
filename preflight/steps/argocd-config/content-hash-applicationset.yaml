@@ -1,0 +1,34 @@
+# One Application per folder in clusters/. Folder name = Argo CD cluster name.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: preflight-content-hash
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        revision: main
+        directories:
+          - path: preflight/steps/content-hash/clusters/*
+  template:
+    metadata:
+      name: 'preflight-content-hash-{{path.basename}}'
+      labels:
+        app.kubernetes.io/part-of: preflight-content-hash
+    spec:
+      project: tsb
+      source:
+        repoURL: git@github.com:devogopan/tsb-gitops.git
+        targetRevision: main
+        path: '{{path}}'
+      destination:
+        name: '{{path.basename}}'
+        namespace: preflight
+      syncPolicy:
+        automated:
+          prune: false
+          selfHeal: false
+        syncOptions:
+          - ServerSideApply=true
+          - CreateNamespace=true

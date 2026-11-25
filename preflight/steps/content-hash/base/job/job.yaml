@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: content-hash
+  namespace: preflight
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+    # Job pod templates are immutable. Apply this hook normally so the old Job is replaced.
+    argocd.argoproj.io/sync-options: ServerSideApply=false
+spec:
+  backoffLimit: 0
+  # The Tetrate PDF estimates about 30 minutes per cluster. A big cluster takes longer.
+  activeDeadlineSeconds: 7200
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: preflight-content-hash
+      containers:
+        - name: check
+          image: docker.io/alpine/k8s:1.34.13
+          envFrom:
+            - configMapRef: {name: content-hash-shared}    # shared: RUN_ID
+            - configMapRef: {name: content-hash-cluster}   # this cluster: name
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              CM="preflight-${RUN_ID}"
+              for t in kubectl jq bash sha256sum awk; do
+                command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
+              done
+              mkdir -p /work && cd /work || exit 1      # fresh directory every run: the script keeps resume state here
+              SHA="$(sha256sum /scripts/content-hash.sh | cut -c1-16)"
+              echo "cluster=${CLUSTER_NAME} run=${RUN_ID} script sha256=${SHA}"
+
+              # The Tetrate script ignores kubectl errors (a failed list looks like "nothing found"),
+              # so its output is scanned below. It is READ ONLY here: DELETE is not set and the delete is commented out.
+              { bash /scripts/content-hash.sh 2>&1; echo $? > /work/rc; } | tee /work/run.out
+              RC="$(cat /work/rc 2>/dev/null || echo 99)"
+
+              REASONS=""
+              addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
+              [ "$RC" = "0" ] || addr "script exited with code $RC"
+              [ -f /work/tsb-missing-hash.log ] || addr "script did not finish (no tsb-missing-hash.log)"
+
+              # kubectl errors the script swallowed
+              FORB="$(grep -ci 'forbidden' /work/run.out || true)"
+              [ "${FORB:-0}" = "0" ] || addr "$FORB permission error(s) (Forbidden), the result cannot be trusted"
+              ERRS="$(grep -E '^(Error|error|Unable|The connection|jq:)' /work/run.out | grep -v "doesn't have a resource type" | head -3 | tr '\n' '|' | sed 's/|$//')"
+              [ -z "$ERRS" ] || addr "kubectl or jq errors: $ERRS"
+              SKIPPED="$(grep "doesn't have a resource type" /work/run.out | sed -n 's/.*resource type "\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+              [ -z "$SKIPPED" ] || echo "WARN: resource types not installed in this cluster, so not checked: $SKIPPED"
+
+              # objects found without a content hash: kind/namespace/name
+              : > /work/objects
+              for f in /work/.cleanup-script-logs/tsb-missing-hash-*.log; do
+                [ -s "$f" ] || continue
+                awk '
+                  function emit() { if (k != "") print k "/" ns "/" n; k = ""; ns = ""; n = ""; m = 0 }
+                  /^---$/ { emit(); next }
+                  /^kind: / { k = $2 }
+                  /^metadata:/ { m = 1; next }
+                  m && /^  namespace: / { ns = $2 }
+                  m && /^  name: / { n = $2 }
+                  /^[a-z]/ { m = 0 }
+                  END { emit() }' "$f" >> /work/objects
+              done
+              sort -u /work/objects -o /work/objects
+              MISSING="$(wc -l < /work/objects | tr -d ' ')"
+              NS="$(wc -l < /work/.cleanup-script-logs/processed_namespaces.txt 2>/dev/null | tr -d ' ')"
+              [ "$MISSING" = "0" ] || addr "$MISSING Istio/XCP object(s) without a content hash, do not delete them, raise with Tetrate"
+              OBJ="$(head -40 /work/objects | tr '\n' '|' | sed 's/|$//')"
+              [ "$MISSING" -le 40 ] || OBJ="${OBJ}|+$((MISSING - 40)) more, see the Job log"
+
+              STATUS=success; [ -z "$REASONS" ] || STATUS=failed
+              NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              kubectl -n preflight get configmap "$CM" >/dev/null 2>&1 || kubectl -n preflight create configmap "$CM" >/dev/null
+              kubectl -n preflight patch configmap "$CM" --type merge -p "$(jq -n \
+                --arg s "$STATUS" --arg c "$CLUSTER_NAME" --arg m "$MISSING" --arg o "$OBJ" --arg ns "${NS:-0}" \
+                --arg sk "$SKIPPED" --arg sha "$SHA" --arg r "$REASONS" --arg t "$NOW" \
+                '{data:{"content-hash":$s,"content-hash.cluster":$c,"content-hash.missing":$m,"content-hash.objects":$o,"content-hash.namespaces":$ns,"content-hash.skippedTypes":$sk,"content-hash.scriptSha":$sha,"content-hash.reason":$r,"content-hash.completedAt":$t}}')" \
+                || { echo "could not write evidence"; exit 1; }
+              echo "SUMMARY: ${NS:-0} namespace(s) checked, $MISSING object(s) without a content hash"
+              echo "RESULT: $STATUS"
+              [ "$STATUS" = "success" ] || exit 1
+          volumeMounts:
+            - {name: script, mountPath: /scripts, readOnly: true}
+            - {name: work, mountPath: /work}
+      volumes:
+        - name: script
+          configMap: {name: content-hash-script}
+        - name: work
+          emptyDir: {}

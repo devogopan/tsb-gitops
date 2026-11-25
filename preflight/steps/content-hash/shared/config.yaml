@@ -1,0 +1,12 @@
+# THE TRIGGER FOR ALL CLUSTERS. One file, applied to every cluster. Edit it in a PR and every
+# cluster's content-hash Job runs, because every cluster's ConfigMap changes.
+#
+#   RUN_ID  change to re-run. Lower-case letters, digits and "-" only.
+#           Use the same value as the other preflight steps of this attempt.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: content-hash-shared
+  namespace: preflight
+data:
+  RUN_ID: "run-008"

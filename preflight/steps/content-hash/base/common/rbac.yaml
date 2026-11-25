@@ -1,0 +1,56 @@
+# Read-only. The script lists Istio and XCP resources in every namespace, so it needs a ClusterRole.
+# The AppProject must allow ClusterRole and ClusterRoleBinding (see argocd-config/appproject-tsb.yaml).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: preflight-content-hash
+  namespace: preflight
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: content-hash-evidence
+  namespace: preflight
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: content-hash-evidence
+  namespace: preflight
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: content-hash-evidence}
+subjects:
+  - {kind: ServiceAccount, name: preflight-content-hash, namespace: preflight}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: preflight-content-hash
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  # the groups of every resource type in content-hash.sh (get and list only, never delete)
+  - apiGroups:
+      - networking.istio.io
+      - security.istio.io
+      - extensions.istio.io
+      - gateway.xcp.tetrate.io
+      - istiointernal.xcp.tetrate.io
+      - security.xcp.tetrate.io
+      - traffic.xcp.tetrate.io
+      - extension.xcp.tetrate.io
+      - xcp.tetrate.io
+    resources: ["*"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: preflight-content-hash
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: preflight-content-hash}
+subjects:
+  - {kind: ServiceAccount, name: preflight-content-hash, namespace: preflight}
