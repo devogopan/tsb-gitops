@@ -27,7 +27,7 @@ spec:
             - |
               set -u
               CM="preflight-${RUN_ID}"
-              for t in kubectl jq openssl base64 awk grep sed sort; do
+              for t in kubectl jq python3 base64 awk grep sed sort; do
                 command -v "$t" >/dev/null || { echo "missing tool in image: $t"; exit 1; }
               done
               REASONS=""; WARNINGS=""; NCERT=0; NEXP=0; NWARN=0; NFAIL=0; SCANNED=""; GWNS=""
@@ -35,7 +35,7 @@ spec:
               addr() { REASONS="${REASONS:+$REASONS; }$1"; echo "FAIL: $1"; }
               warn() { WARNINGS="${WARNINGS:+$WARNINGS|}$1"; echo "WARN: $1"; }
               echo "cluster=${CLUSTER_NAME} run=${RUN_ID} namespaces='${CERT_NAMESPACES}' minDays=${MIN_DAYS} warnDays=${WARN_DAYS} postgres=${POSTGRES_CHECK}"
-              W=/work; TAB="$(printf '\t')"; MIN_S=$(( MIN_DAYS * 86400 )); WARN_S=$(( WARN_DAYS * 86400 ))
+              W=/work; TAB="$(printf '\t')"
               : > $W/certs.txt; SEEN=""
 
               # ---- 1. the gateway namespaces must all be covered by CERT_NAMESPACES -------------------------------------------
@@ -53,7 +53,40 @@ spec:
               if [ -n "$GWNS" ]; then echo "gateway namespaces found: $GWNS"; else warn "no gateway install objects found (types: ${GWTYPES:-none}), so no gateway namespace was checked for coverage"; fi
 
               # ---- 2. certificates ---------------------------------------------------------------------------------------------
+              # The image has no openssl, so python3 reads the certificates (ssl module, no extra package).
               # Only CERTIFICATE blocks leave jq. Secrets are held in a shell variable, never written to a file.
+              cat > $W/certs.py <<'PYEOF'
+              import sys, ssl, base64, hashlib, time, os
+              # stdin: namespace <TAB> name <TAB> key <TAB> base64(PEM). argv: minDays warnDays kind
+              # stdout (TAB separated, no empty fields): STATUS loc subject notAfter daysLeft sha256-of-DER
+              # STATUS is EXPIRED, FAIL (inside minDays), WARN (inside warnDays), ok, or ERROR (cannot parse; subject holds the reason)
+              min_s = int(sys.argv[1]) * 86400
+              warn_s = int(sys.argv[2]) * 86400
+              kind = sys.argv[3]
+              tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "one.pem")
+              now = time.time()
+              def dn(rdns):
+                  return ",".join("%s=%s" % (k, v) for rdn in rdns for (k, v) in rdn) or "-"
+              for line in sys.stdin:
+                  p = line.rstrip("\n").split("\t")
+                  if len(p) != 4:
+                      continue
+                  loc = "%s/%s/%s:%s" % (kind, p[0], p[1], p[2])
+                  try:
+                      pem = base64.b64decode(p[3]).decode("ascii")
+                      with open(tmp, "w") as f:
+                          f.write(pem)
+                      d = ssl._ssl._test_decode_cert(tmp)
+                      end = d["notAfter"]
+                      secs = ssl.cert_time_to_seconds(end)
+                      fp = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+                      left = secs - now
+                      st = "EXPIRED" if left <= 0 else "FAIL" if left < min_s else "WARN" if left < warn_s else "ok"
+                      print("\t".join([st, loc, dn(d.get("subject", ())), end.replace("\t", " ").replace(" ", "_"), str(int(left // 86400)), fp]))
+                  except Exception as e:
+                      print("\t".join(["ERROR", loc, str(e).replace("\t", " ").replace("\n", " ") or "-", "-", "0", "-"]))
+              PYEOF
+
               JQ_CERTS='.items[] | . as $o | ($o.data // {}) | to_entries[] | . as $e
                 | ((if $dec then (try ($e.value | @base64d) catch "") else $e.value end)
                    | [match("-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----"; "g").string]) as $c
@@ -65,27 +98,20 @@ spec:
                 JSON="$(kubectl -n "$ns" get "$kind" -o json 2>$W/err)" || { addr "cannot read $kind in namespace $ns: $(head -1 $W/err)"; return; }
                 printf '%s' "$JSON" | jq -r --argjson dec "$dec" "$JQ_CERTS" > $W/found.tsv 2>$W/err || { addr "cannot read certificates from $kind in $ns: $(head -1 $W/err)"; JSON=""; return; }
                 JSON=""
-                while IFS="$TAB" read -r cns cname ckey cb64; do
-                  printf '%s' "$cb64" | base64 -d > $W/one.pem 2>/dev/null
-                  loc="$kind/$cns/$cname:$ckey"
-                  SUBJ="$(openssl x509 -in $W/one.pem -noout -subject 2>/dev/null)" || { addr "cannot parse the certificate at $loc"; continue; }
-                  FP="$(openssl x509 -in $W/one.pem -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')"
+                python3 $W/certs.py "$MIN_DAYS" "$WARN_DAYS" "$kind" < $W/found.tsv > $W/parsed.tsv 2>$W/err || { addr "cannot parse certificates from $kind in $ns: $(tail -1 $W/err)"; return; }
+                while IFS="$TAB" read -r ST loc SUBJ END DAYS FP; do
+                  END="$(printf '%s' "$END" | tr '_' ' ')"
+                  [ "$ST" != "ERROR" ] || { addr "cannot parse the certificate at $loc: $SUBJ"; continue; }
                   case " $SEEN " in *" $FP "*) continue ;; esac     # the same certificate in several places counts once
                   SEEN="$SEEN $FP"
-                  END="$(openssl x509 -in $W/one.pem -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
                   NCERT=$(( NCERT + 1 ))
-                  if ! openssl x509 -in $W/one.pem -noout -checkend 0 >/dev/null 2>&1; then
-                    ST=EXPIRED; NEXP=$(( NEXP + 1 ))
-                    addr "certificate EXPIRED: $loc ($SUBJ) notAfter $END"
-                  elif ! openssl x509 -in $W/one.pem -noout -checkend "$MIN_S" >/dev/null 2>&1; then
-                    ST=FAIL; NFAIL=$(( NFAIL + 1 ))
-                    addr "certificate expires within ${MIN_DAYS} days: $loc ($SUBJ) notAfter $END"
-                  elif ! openssl x509 -in $W/one.pem -noout -checkend "$WARN_S" >/dev/null 2>&1; then
-                    ST=WARN; NWARN=$(( NWARN + 1 ))
-                    warn "certificate expires within ${WARN_DAYS} days: $loc ($SUBJ) notAfter $END"
-                  else ST=ok; fi
-                  echo "$ST|$loc|$SUBJ|notAfter $END" >> $W/certs.txt
-                done < $W/found.tsv
+                  case "$ST" in
+                    EXPIRED) NEXP=$(( NEXP + 1 )); addr "certificate EXPIRED: $loc ($SUBJ) notAfter $END" ;;
+                    FAIL)    NFAIL=$(( NFAIL + 1 )); addr "certificate expires in ${DAYS} days, within ${MIN_DAYS}: $loc ($SUBJ) notAfter $END" ;;
+                    WARN)    NWARN=$(( NWARN + 1 )); warn "certificate expires in ${DAYS} days, within ${WARN_DAYS}: $loc ($SUBJ) notAfter $END" ;;
+                  esac
+                  echo "$ST|$loc|$SUBJ|notAfter $END ($DAYS days)" >> $W/certs.txt
+                done < $W/parsed.tsv
               }
 
               for ns in $CERT_NAMESPACES; do
