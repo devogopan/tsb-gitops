@@ -13,6 +13,10 @@ data:
   EXPORT_TYPES: >-
     managementplanes.install.tetrate.io
     controlplanes.install.tetrate.io
+    gateways.install.tetrate.io
+    ingressgateways.install.tetrate.io
+    egressgateways.install.tetrate.io
+    tier1gateways.install.tetrate.io
     kubegres.kubegres.reactive-tech.io
     istiooperators.install.istio.io
     gateways.networking.istio.io
@@ -46,3 +50,6 @@ data:
     externalsecrets.external-secrets.io
     secretstores.external-secrets.io
     clustersecretstores.external-secrets.io
+    certificates.cert-manager.io
+    issuers.cert-manager.io
+    clusterissuers.cert-manager.io

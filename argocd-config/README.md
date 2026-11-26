@@ -9,7 +9,7 @@ No Argo CD Application watches this folder. A named person applies changes by ha
 | `tsb-base-application.yaml` | Application for `config/base` |
 | `tsb-routes-applicationset.yaml` | One Application per `config/routes/*` folder |
 
-Preflight Applications and ApplicationSets live in `preflight/steps/argocd-config/`.
+Preflight Applications and ApplicationSets live in `preflight/steps/argocd-config/` (one file per step, plus `backup-storage-applicationset.yaml`). Apply the AppProject first, then the backup storage, then the steps. See the repo `README.md`.
 
 Apply (AppProject first):
 

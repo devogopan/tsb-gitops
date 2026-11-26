@@ -53,6 +53,7 @@ rules:
       - install.tetrate.io
       - kubegres.reactive-tech.io
       - external-secrets.io
+      - cert-manager.io
     resources: ["*"]
     verbs: ["get", "list"]
 ---
