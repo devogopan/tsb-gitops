@@ -13,3 +13,5 @@ spec:
     names:
     - demo/app-httpbin
     - demo/tier2
+    - abc/app-httpbin
+    - abc/tier2
